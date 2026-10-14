@@ -572,3 +572,5 @@ pyrightconfig.json
 
 # End of https://www.toptal.com/developers/gitignore/api/visualstudiocode,python,c++,cuda,jupyternotebooks,cmake,latex
 HW3.md
+src/python/test.py
+tensor_temp.cuh

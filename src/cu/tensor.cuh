@@ -3,6 +3,7 @@
 #include <memory>
 #include <stdexcept>
 #include <vector>
+#include <map>
 #include <ranges>
 #include <cstdlib>
 #include <cuda_runtime.h>
@@ -303,41 +304,48 @@ namespace graph
 {
     class TensorImpl;
     class Node;
-    using edge = std::pair<std::shared_ptr<Node *>, int>;
-    using grad = std::vector<std::shared_ptr<TensorImpl>>;
+    using edge = std::pair<std::shared_ptr<Node>, int>;
+    using tensorPtr = std::shared_ptr<TensorImpl>;
 
     class Node
     {
-    private:
+    protected:
         std::vector<edge> next_edges_;
+        std::vector<tensorPtr> prev_grads_;
 
     public:
-        Node(std::vector<edge> next_nodes) : next_edges_(next_nodes) {}
+        Node(std::vector<edge> next_nodes, int grads_num)
+            : next_edges_(next_nodes), prev_grads_(grads_num) {}
+        Node(int edges_num, int grads_num)
+            : next_edges_(edges_num), prev_grads_(grads_num) {}
         edge getEdge(int i)
         {
             return next_edges_.at(i);
         }
-        virtual grad backward(grad previous) = 0;
+        std::vector<edge> &next_edges() { return next_edges_; }
+        std::vector<tensorPtr> &prev_grads() { return prev_grads_; }
+        void accumulate_grads(tensorPtr prev, int idx);
+        virtual std::vector<tensorPtr> backward() = 0;
     };
 
     class AccumulateGrad : public Node
     {
     private:
-        std::shared_ptr<TensorImpl> t_;
+        tensorPtr t_;
 
     public:
-        AccumulateGrad(std::shared_ptr<TensorImpl> t) : Node({}), t_(t) {}
-        grad backward(grad previous);
+        AccumulateGrad(tensorPtr t) : Node({}, 1), t_(t) {}
+        std::vector<tensorPtr> backward();
     };
 
     struct AutogradMeta
     {
-        std::shared_ptr<Node *> grad_fn_ = nullptr;
+        std::shared_ptr<Node> grad_fn_ = nullptr;
         std::shared_ptr<AccumulateGrad> accumulator_ = nullptr;
-        std::shared_ptr<TensorImpl *> grad_ = nullptr;
+        tensorPtr grad_ = nullptr;
 
         AutogradMeta() = default;
-        AutogradMeta(std::shared_ptr<Node *> grad_fn) : grad_fn_(grad_fn) {}
+        AutogradMeta(std::shared_ptr<Node> grad_fn) : grad_fn_(grad_fn) {}
         AutogradMeta(std::shared_ptr<AccumulateGrad> accumulator)
             : accumulator_(accumulator) {}
     };
@@ -361,6 +369,10 @@ namespace graph
 
         base::TensorPart &data() { return *data_; }
         const base::TensorPart &data() const { return *data_; }
+        const base::s_vec &shape() const { return data_->shape(); }
+        base::Device device() const { return data_->device(); }
+        base::TypeMeta type() const { return data_->type(); }
+
         AutogradMeta &autograd() { return autograd_; }
 
         void fill(float f)
@@ -398,10 +410,68 @@ namespace graph
         void print() const;
 
         bool requires_grad() const { return requires_grad_; }
+
+        void accumulate(tensorPtr t)
+        {
+            (*data_) += t->data();
+        }
+    };
+
+    class Engine
+    {
+    private:
+        std::map<std::shared_ptr<Node>, int> nodes_count;
+        void count_node_dfs(std::shared_ptr<Node> n);
+
+    public:
+        Engine() {}
+        void backward(tensorPtr t, tensorPtr grad = nullptr);
     };
 }
 
 namespace opration
 {
+    class Opr
+    {
+    public:
+        virtual std::shared_ptr<graph::Node> makeNode(std::vector<graph::tensorPtr>) = 0;
+        virtual graph::tensorPtr operator()(std::vector<graph::tensorPtr>) = 0;
+    };
+
+    class AddOpr;
+    class AddNode : public graph::Node
+    {
+    public:
+        AddNode(std::vector<graph::tensorPtr> adds) : Node(adds.size(), 1)
+        {
+            for (int i = 0; i < adds.size(); i++)
+            {
+                next_edges_[i] = {adds[i]->autograd().grad_fn_, 0};
+            }
+        }
+        std::vector<graph::tensorPtr> backward()
+        {
+            if (!prev_grads_[0])
+                throw std::invalid_argument("No grad to be backward.");
+            return {prev_grads_[0], prev_grads_[0]};
+        }
+    };
+
+    class AddOpr : public Opr
+    {
+    public:
+        std::shared_ptr<graph::Node> makeNode(std::vector<graph::tensorPtr> adds)
+        {
+            return std::make_shared<graph::Node>(adds);
+        }
+        graph::tensorPtr operator()(std::vector<graph::tensorPtr> adds)
+        {
+            graph::tensorPtr result = std::make_shared<graph::TensorImpl>(
+                adds[0]->shape(), adds[0]->type(), adds[0]->device());
+            for (auto add : adds)
+                result->accumulate(add);
+            result->autograd().grad_fn_ = makeNode(adds);
+        }
+    };
 
 }

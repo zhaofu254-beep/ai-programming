@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstdlib>
 #include <iostream>
+#include <stack>
+#include <set>
 
 #include <tensor.cuh>
 
@@ -491,5 +493,90 @@ namespace graph
 
 namespace graph
 {
+    // 其余graph功能实现
 
+    // Node::accumulate_grads —— 把梯度累加到 prev_grads_[idx]（支持同一张量被多次使用）
+    void Node::accumulate_grads(tensorPtr prev, int idx)
+    {
+        if (!prev_grads_[idx])
+            prev_grads_[idx] = prev;
+        else
+            prev_grads_[idx]->accumulate(prev);
+    }
+
+    // AccumulateGrad::backward —— 把入向梯度正确写回叶子 .grad_
+    std::vector<tensorPtr> AccumulateGrad::backward()
+    {
+        if (!t_->requires_grad() || !prev_grads_[0])
+            return {};
+        tensorPtr &grad = t_->autograd().grad_;
+        if (!grad)
+            grad = prev_grads_[0];
+        else
+            grad->accumulate(prev_grads_[0]);
+        return {};
+    }
+
+    // Engine::count_node_dfs —— 统计每个节点的入度（父边数），用 visited 去重避免 DAG 重复遍历
+    void Engine::count_node_dfs(std::shared_ptr<Node> n)
+    {
+        nodes_count.clear();
+        if (!n) // 叶子 / 未接图，无入度可统计
+            return;
+        std::stack<std::shared_ptr<Node>> stack;
+        std::set<std::shared_ptr<Node>> seen;
+        stack.push(n);
+        seen.insert(n);
+        while (!stack.empty())
+        {
+            std::shared_ptr<Node> node = stack.top();
+            stack.pop();
+            for (auto &next_node : node->next_edges())
+            {
+                nodes_count[next_node.first] += 1;       // 每条父边使 child 入度 +1
+                if (seen.insert(next_node.first).second) // 首次见到才入栈
+                    stack.push(next_node.first);
+            }
+        }
+    }
+
+    // Engine::backward —— 拓扑序反向传播；去掉重复默认实参；用 accumulate_grads 累加路由
+    void Engine::backward(tensorPtr t, tensorPtr grad)
+    {
+        std::shared_ptr<Node> root = t->autograd().grad_fn_;
+        if (!root) // 叶子张量或未接入计算图，无梯度可传播
+            return;
+
+        if (!grad)
+        {
+            grad = std::make_shared<TensorImpl>(
+                t->shape(), t->type(), t->device(), false);
+            grad->fill(1);
+        }
+
+        count_node_dfs(root);
+
+        std::stack<std::shared_ptr<Node>> stack;
+        root->prev_grads()[0] = grad; // 根节点输出梯度（种子），入度天然为 0
+        stack.push(root);
+
+        while (!stack.empty())
+        {
+            std::shared_ptr<Node> node = stack.top();
+            stack.pop();
+
+            std::vector<edge> &edges = node->next_edges();
+            std::vector<tensorPtr> grads = node->backward();
+            if (grads.empty())
+                continue;
+
+            for (size_t i = 0; i < edges.size() && i < grads.size(); ++i)
+            {
+                std::shared_ptr<Node> child = edges[i].first;
+                child->accumulate_grads(grads[i], edges[i].second);
+                if (--nodes_count[child] == 0)
+                    stack.push(child);
+            }
+        }
+    }
 }

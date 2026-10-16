@@ -557,7 +557,7 @@ namespace graph
         count_node_dfs(root);
 
         std::stack<std::shared_ptr<Node>> stack;
-        root->prev_grads()[0] = grad; // 根节点输出梯度（种子），入度天然为 0
+        root->accumulate_grads(grad, 0); // 根节点输出梯度（种子），入度天然为 0
         stack.push(root);
 
         while (!stack.empty())
@@ -565,18 +565,28 @@ namespace graph
             std::shared_ptr<Node> node = stack.top();
             stack.pop();
 
-            std::vector<edge> &edges = node->next_edges();
+            int edges_num = node->edges_num();
             std::vector<tensorPtr> grads = node->backward();
             if (grads.empty())
                 continue;
 
-            for (size_t i = 0; i < edges.size() && i < grads.size(); ++i)
+            for (size_t i = 0; i < edges_num && i < edges_num; ++i)
             {
-                std::shared_ptr<Node> child = edges[i].first;
-                child->accumulate_grads(grads[i], edges[i].second);
+                graph::edge &edge = node->getEdge(i);
+                std::shared_ptr<Node> child = edge.first;
+                child->accumulate_grads(grads[i], edge.second);
                 if (--nodes_count[child] == 0)
                     stack.push(child);
             }
         }
+    }
+}
+
+namespace operation
+{
+    // 实现算子
+
+    graph::tensorPtr SumOpr::operator()(std::vector<graph::tensorPtr> inputs)
+    {
     }
 }

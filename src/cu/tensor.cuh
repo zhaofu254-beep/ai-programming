@@ -4,6 +4,7 @@
 #include <stdexcept>
 #include <vector>
 #include <map>
+#include <array>
 #include <ranges>
 #include <cstdlib>
 #include <cuda_runtime.h>
@@ -318,12 +319,13 @@ namespace graph
             : next_edges_(next_nodes), prev_grads_(grads_num) {}
         Node(int edges_num, int grads_num)
             : next_edges_(edges_num), prev_grads_(grads_num) {}
-        edge getEdge(int i)
+
+        edge &getEdge(int i)
         {
             return next_edges_.at(i);
         }
-        std::vector<edge> &next_edges() { return next_edges_; }
-        std::vector<tensorPtr> &prev_grads() { return prev_grads_; }
+        const std::vector<edge> &next_edges() { return next_edges_; }
+        int edges_num() { return next_edges_.size(); }
         void accumulate_grads(tensorPtr prev, int idx);
         virtual std::vector<tensorPtr> backward() = 0;
     };
@@ -429,49 +431,91 @@ namespace graph
     };
 }
 
-namespace opration
+namespace operation
 {
     class Opr
     {
     public:
+        virtual bool broadcastingSupport() = 0;
         virtual std::shared_ptr<graph::Node> makeNode(std::vector<graph::tensorPtr>) = 0;
         virtual graph::tensorPtr operator()(std::vector<graph::tensorPtr>) = 0;
     };
 
-    class AddOpr;
-    class AddNode : public graph::Node
+    class SumOpr;
+    class SumNode : public graph::Node
     {
-    public:
-        AddNode(std::vector<graph::tensorPtr> adds) : Node(adds.size(), 1)
+    private:
+        base::s_vec inputStrides, inputShape, dims;
+
+        SumNode(std::vector<graph::tensorPtr> adds) : Node(1, 1)
         {
-            for (int i = 0; i < adds.size(); i++)
-            {
-                next_edges_[i] = {adds[i]->autograd().grad_fn_, 0};
-            }
+            next_edges_[0] = {adds[0]->autograd().grad_fn_, 0};
         }
+        friend SumOpr;
+
+    public:
         std::vector<graph::tensorPtr> backward()
         {
             if (!prev_grads_[0])
                 throw std::invalid_argument("No grad to be backward.");
-            return {prev_grads_[0], prev_grads_[0]};
         }
     };
 
-    class AddOpr : public Opr
+    class SumOpr
     {
+    private:
+        base::s_vec dims_;
+        std::shared_ptr<graph::Node> makeNode(std::vector<graph::tensorPtr> inputs)
+        {
+            return std::shared_ptr<graph::Node>(new SumNode(inputs));
+        }
+
     public:
-        std::shared_ptr<graph::Node> makeNode(std::vector<graph::tensorPtr> adds)
+        bool broadcastingSupport() { return false; }
+        void setDims(base::s_vec dims) { dims_ = dims; }
+        graph::tensorPtr operator()(std::vector<graph::tensorPtr> inputs);
+    };
+
+    class ElimentWiseOpr;
+    class ElimentWiseNode : public graph::Node
+    {
+    private:
+        base::s_vec input1Shape, input2Shape, outputShape;
+
+        ElimentWiseNode(std::vector<graph::tensorPtr> inputs) : Node(2, 1)
         {
-            return std::make_shared<graph::Node>(adds);
+            for (int i = 0; i < inputs.size(); i++)
+            {
+                next_edges_[i] = {inputs[i]->autograd().grad_fn_, 0};
+            }
         }
-        graph::tensorPtr operator()(std::vector<graph::tensorPtr> adds)
+        friend ElimentWiseOpr;
+
+    public:
+        std::vector<graph::tensorPtr> backward();
+    };
+
+    class ElimentWiseOpr : public Opr
+    {
+    private:
+        std::shared_ptr<graph::Node> makeNode(std::vector<graph::tensorPtr> inputs)
         {
-            graph::tensorPtr result = std::make_shared<graph::TensorImpl>(
-                adds[0]->shape(), adds[0]->type(), adds[0]->device());
-            for (auto add : adds)
-                result->accumulate(add);
-            result->autograd().grad_fn_ = makeNode(adds);
+            return std::shared_ptr<graph::Node>(new ElimentWiseNode(inputs));
         }
+
+    public:
+        bool broadcastingSupport() { return true; }
+        graph::tensorPtr operator()(std::vector<graph::tensorPtr> inputs);
+        // {
+        //     if (inputs.size() != 2)
+        //         throw(std::invalid_argument("Require Two arguments"));
+
+        //     graph::tensorPtr result = std::make_shared<graph::TensorImpl>(
+        //         inputs[0]->shape(), inputs[0]->type(), inputs[0]->device());
+        //     for (auto add : inputs)
+        //         result->accumulate(add);
+        //     result->autograd().grad_fn_ = makeNode(inputs);
+        // }
     };
 
 }

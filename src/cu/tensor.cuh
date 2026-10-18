@@ -372,10 +372,15 @@ namespace graph
         base::TensorPart &data() { return *data_; }
         const base::TensorPart &data() const { return *data_; }
         const base::s_vec &shape() const { return data_->shape(); }
+        const base::s_vec &stride() const { return data_->strides(); }
         base::Device device() const { return data_->device(); }
         base::TypeMeta type() const { return data_->type(); }
+        int64_t numel() { return data_->numel(); }
 
-        AutogradMeta &autograd() { return autograd_; }
+        AutogradMeta &autograd()
+        {
+            return autograd_;
+        }
 
         void fill(float f)
         {

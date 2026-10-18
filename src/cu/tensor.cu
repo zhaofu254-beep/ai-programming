@@ -6,6 +6,7 @@
 #include <iostream>
 #include <stack>
 #include <set>
+#include <algorithm>
 
 #include <tensor.cuh>
 
@@ -585,6 +586,140 @@ namespace graph
 namespace operation
 {
     // 实现算子
+
+    std::array<base::s_vec, 3> coalesce_dimensions(
+        base::s_vec shape, base::s_vec stride, std::vector<bool> masked_dims)
+    { // 维度归约,依次返回new_shape,new_stride,new_masked_dims_idx；
+        base::s_vec new_shape, new_stride, new_masked_dims_idx;
+        int64_t new_dim = 1;
+        for (int start = new_shape.size() - 1, end = new_shape.size() - 1;;)
+        {
+            if (end < 0)
+            {
+                if (start >= 0)
+                {
+                    new_shape.push_back(new_dim);
+                    new_stride.push_back(stride[start]);
+                }
+                break;
+            }
+            if (end == start)
+            {
+                new_dim = shape[start];
+                end -= 1;
+                continue;
+            }
+            if (masked_dims[end])
+            {
+                new_shape.push_back(new_dim);
+                new_stride.push_back(stride[start]);
+                new_shape.push_back(shape[end]);
+                new_stride.push_back(stride[end]);
+                end -= 1;
+                start = end;
+                new_masked_dims_idx.push_back(new_shape.size());
+                continue;
+            }
+            if (stride[end] != stride[end + 1] * shape[end])
+            {
+                new_shape.push_back(new_dim);
+                new_stride.push_back(stride[start]);
+                start = end;
+            }
+            else
+            {
+                new_dim *= shape[end];
+                end -= 1;
+            }
+        }
+        std::reverse(new_shape.begin(), new_shape.end());
+        std::reverse(new_stride.begin(), new_stride.end());
+        return {new_shape, new_stride, new_masked_dims_idx};
+    }
+
+    template <typename T>
+    __global__ void smallDimReduceKernel(T *output, const T *input,
+                                         const int32_t input_dim[],
+                                         const int32_t output_dim[],
+                                         const int32_t input_stride[],
+                                         const int32_t output_stride[],
+                                         const int32_t rdim,
+                                         const int32_t input_dim_num)
+    { // 先实现只能归约一个维度的，规约维度较小时直接相加的版本
+        int32_t idx = gridDim.x * blockIdx.x + threadIdx.x;
+        int32_t idx_out = 0;
+
+        for (int i = 0; i < rdim; i++)
+        {
+            int_t c = (idx / input_stride[input_dim_num - i]) % input_dim[input_dim_num - i];
+            idx_out += c * output_stride[input_dim_num - i - 1];
+        }
+        for (int i = rdim + 1; i < input_dim_num; i++)
+        {
+            int_t c = (idx / input_stride[input_dim_num - i]) % input_dim[input_dim_num - i];
+            idx_out += c * output_stride[input_dim_num - i];
+        }
+        int32_t reduceIdx = idx - (idx / input_stride[rdim]) * input_stride[rdim];
+
+        T v = 0;
+        for (int i = 0; i < input_dim[rdim]; i++)
+        {
+            v += input[reduceIdx];
+            reduceIdx += input_stride[rdim];
+        }
+
+        output[idx_out] = v;
+    }
+
+    template <typename T>
+    graph::tensorPtr smallDimReduce(graph::tensorPtr t, const int32_t rdim)
+    {
+        base::s_vec reduced_shape(t->shape().size() - 1, 0);
+        for (int i = 0; i < new_rdim; i++)
+            reduced_shape[i] = t->shape[i];
+        for (int i = new_rdim + 1; i < t->shape().size(); i++)
+            reduced_shape[i - 1] = t->shape[i];
+
+        graph::tensorPtr reduced =
+            std::make_shared(reduced_shape, t->type(), t->device(), t->requires_grad());
+        std::vector<bool>
+            masked_dims = std::vector<bool>(t->shape().size(), 0);
+        masked_dims[rdim] = 1;
+
+        auto [new_shape, new_stride, new_rdim_idx] =
+            coalesce_dimensions(t->shape(), t->stride(), masked_dims);
+        new_rdim = new_rdim_idx[0];
+        const int32_t *input_dim = new int32_t(new_shape.size()),
+                      output_dim = new int32_t(new_shape.size() - 1),
+                      input_stride = new int32_t(new_shape.size()),
+                      output_stride = new int32_t(new_shape.size() - 1);
+
+        for (int i = 0; i < new_rdim; i++)
+        {
+            input_dim[i] = new_shape[i];
+            output_dim[i] = new_shape[i];
+            input_stride[i] = new_stride[i];
+        }
+        input_dim[new_rdim] = new_shape[new_rdim];
+        input_stride[new_rdim] = new_stride[new_rdim];
+        for (int i = new_rdim + 1; i < new_shape.size(); i++)
+        {
+            input_dim[i] = new_shape[i];
+            output_dim[i - 1] = new_shape[i];
+            input_stride[i] = new_stride[i];
+        }
+        output_stride[output_dim.size() - 1] = 1;
+        for (int i = output_dim.size() - 1; i >= 0; i--)
+            output_stride[i] = output_stride[i + 1] * output_dim[i + 1];
+
+        const int BLOCK_SIZE = 1024;
+        int grid_size = (reduced->numel() + BLOCK_SIZE - 1) / BLOCK_SIZE;
+        smallDimReduceKernel<<<grid_size, BLOCK_SIZE>>>(reduced->data().data(), t->data().data(),
+                                                        input_dim, output_dim, input_stride,
+                                                        output_stride, rdim);
+
+        return reduced;
+    }
 
     graph::tensorPtr SumOpr::operator()(std::vector<graph::tensorPtr> inputs)
     {

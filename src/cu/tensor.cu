@@ -587,138 +587,214 @@ namespace operation
 {
     // 实现算子
 
+    // coalesce_dimensions —— 合并相邻且连续（stride[i] == stride[i+1]*shape[i+1]）的非归约维；
+    // 返回 {new_shape, new_stride, new_masked_dims_idx}（归约维在新坐标系中的下标）。
     std::array<base::s_vec, 3> coalesce_dimensions(
         base::s_vec shape, base::s_vec stride, std::vector<bool> masked_dims)
-    { // 维度归约,依次返回new_shape,new_stride,new_masked_dims_idx；
+    {
         base::s_vec new_shape, new_stride, new_masked_dims_idx;
-        int64_t new_dim = 1;
-        for (int start = new_shape.size() - 1, end = new_shape.size() - 1;;)
+        int64_t n = static_cast<int64_t>(shape.size());
+
+        int64_t i = n - 1;
+        while (i >= 0)
         {
-            if (end < 0)
-            {
-                if (start >= 0)
-                {
-                    new_shape.push_back(new_dim);
-                    new_stride.push_back(stride[start]);
-                }
-                break;
-            }
-            if (end == start)
-            {
-                new_dim = shape[start];
-                end -= 1;
-                continue;
-            }
-            if (masked_dims[end])
-            {
-                new_shape.push_back(new_dim);
-                new_stride.push_back(stride[start]);
-                new_shape.push_back(shape[end]);
-                new_stride.push_back(stride[end]);
-                end -= 1;
-                start = end;
-                new_masked_dims_idx.push_back(new_shape.size());
-                continue;
-            }
-            if (stride[end] != stride[end + 1] * shape[end])
-            {
-                new_shape.push_back(new_dim);
-                new_stride.push_back(stride[start]);
-                start = end;
+            if (masked_dims[i])
+            { // 归约维不能合并，单独保留
+                new_shape.push_back(shape[i]);
+                new_stride.push_back(stride[i]);
+                new_masked_dims_idx.push_back(static_cast<int64_t>(new_shape.size()) - 1);
+                i -= 1;
             }
             else
-            {
-                new_dim *= shape[end];
-                end -= 1;
+            { // 从内向外合并连续的非归约维
+                int64_t merged_size = shape[i];
+                int64_t innermost_stride = stride[i];
+                int64_t j = i - 1;
+                while (j >= 0 && !masked_dims[j] &&
+                       stride[j] == stride[j + 1] * shape[j + 1])
+                {
+                    merged_size *= shape[j];
+                    j -= 1;
+                }
+                new_shape.push_back(merged_size);
+                new_stride.push_back(innermost_stride);
+                i = j;
             }
         }
+
+        // 上面从内向外 push，reverse 后变为从外向内；同步重映射归约维下标
         std::reverse(new_shape.begin(), new_shape.end());
         std::reverse(new_stride.begin(), new_stride.end());
+        int64_t m = static_cast<int64_t>(new_shape.size());
+        for (auto &idx : new_masked_dims_idx)
+            idx = m - 1 - idx;
+
         return {new_shape, new_stride, new_masked_dims_idx};
     }
 
     template <typename T>
-    __global__ void smallDimReduceKernel(T *output, const T *input,
-                                         const int32_t input_dim[],
-                                         const int32_t output_dim[],
-                                         const int32_t input_stride[],
-                                         const int32_t output_stride[],
-                                         const int32_t rdim,
-                                         const int32_t input_dim_num)
-    { // 先实现只能归约一个维度的，规约维度较小时直接相加的版本
-        int32_t idx = gridDim.x * blockIdx.x + threadIdx.x;
-        int32_t idx_out = 0;
-
-        for (int i = 0; i < rdim; i++)
+    graph::tensorPtr smallDimReduceCPU(graph::tensorPtr t, const int64_t rdim)
+    {
+        base::s_vec out_shape;
+        int64_t ndim = t->shape().size();
+        out_shape.reserve(ndim - 1);
+        for (int64_t i = 0; i < ndim; ++i)
+            if (i != rdim)
+                out_shape.push_back(t->shape()[i]);
+        graph::tensorPtr reduced = std::make_shared<graph::TensorImpl>(
+            out_shape, t->type(), t->device(), t->requires_grad());
+        base::s_vec coor(ndim, 0);
+        int64_t reduced_idx = 0;
+        T *reduced_data = static_cast<T *>(reduced->data().data());
+        T *t_data = static_cast<T *>(t->data().data());
+        for (int n = 0; n < reduced->numel(); n++)
         {
-            int_t c = (idx / input_stride[input_dim_num - i]) % input_dim[input_dim_num - i];
-            idx_out += c * output_stride[input_dim_num - i - 1];
+            reduced_idx += reduced->stride()[ndim - 2];
+            coor[ndim - 2] += 1;
+            for (int i = ndim - 2; i >= 0; i--)
+            {
+                if (coor[i] >= reduced->shape()[i])
+                {
+                    coor[i] = 0;
+                    coor[i - 1] += 1;
+                    reduced_idx -= reduced->shape()[i] * reduced->stride()[i];
+                    reduced_idx += reduced->stride()[i - 1];
+                }
+                else
+                    break;
+            }
+            int64_t t_idx = 0;
+            for (int i = 0; i < ndim - 1; i++)
+                t_idx += coor[i] * t->stride()[i];
+            for (int i = 0; i < t->shape()[rdim]; i++)
+            {
+                reduced_data[reduced_idx] += t_data[t_idx];
+                t_idx += t->stride()[rdim];
+            }
         }
-        for (int i = rdim + 1; i < input_dim_num; i++)
-        {
-            int_t c = (idx / input_stride[input_dim_num - i]) % input_dim[input_dim_num - i];
-            idx_out += c * output_stride[input_dim_num - i];
-        }
-        int32_t reduceIdx = idx - (idx / input_stride[rdim]) * input_stride[rdim];
-
-        T v = 0;
-        for (int i = 0; i < input_dim[rdim]; i++)
-        {
-            v += input[reduceIdx];
-            reduceIdx += input_stride[rdim];
-        }
-
-        output[idx_out] = v;
+        return reduced;
     }
 
+    // smallDimReduceKernel —— 单维归约：每个线程负责一个输出位置，串行累加归约维。
+    // 工作在合并后的维度上（input_dim/input_stride/rdim 均为 coalesce 之后的结果）。
+    const int MAX_SMALL_DIM_SIZE = 8;
+    struct SmallReduceKernelDimStride
+    { // 用于向kernel传参，当维度个数大于8时，默认不使用smallDimReduce
+        int64_t input_dim[MAX_SMALL_DIM_SIZE];
+        int64_t input_stride[MAX_SMALL_DIM_SIZE];
+        int64_t output_stride[MAX_SMALL_DIM_SIZE];
+    };
     template <typename T>
-    graph::tensorPtr smallDimReduce(graph::tensorPtr t, const int32_t rdim)
+    __global__ void smallDimReduceKernel(T *output, const T *input,
+                                         const int64_t out_numel,
+                                         SmallReduceKernelDimStride s,
+                                         const int64_t rdim,
+                                         const int ndim)
     {
-        base::s_vec reduced_shape(t->shape().size() - 1, 0);
-        for (int i = 0; i < new_rdim; i++)
-            reduced_shape[i] = t->shape[i];
-        for (int i = new_rdim + 1; i < t->shape().size(); i++)
-            reduced_shape[i - 1] = t->shape[i];
+        int64_t idx = blockDim.x * blockIdx.x + threadIdx.x;
+        if (idx >= out_numel)
+            return;
 
-        graph::tensorPtr reduced =
-            std::make_shared(reduced_shape, t->type(), t->device(), t->requires_grad());
-        std::vector<bool>
-            masked_dims = std::vector<bool>(t->shape().size(), 0);
-        masked_dims[rdim] = 1;
+        // 把 idx 按行主序分解为输出坐标，映射回输入偏移（跳过归约维）
+        int64_t rem = idx;
+        int64_t in_off = 0;
+        for (int od = 0; od < ndim - 1; ++od)
+        {
+            int64_t c = rem / s.output_stride[od];
+            rem -= c * s.output_stride[od];
+            int d = (od < rdim) ? od : od + 1;
+            in_off += c * s.input_stride[d];
+        }
 
-        auto [new_shape, new_stride, new_rdim_idx] =
+        T v = 0;
+        for (int64_t j = 0; j < s.input_dim[rdim]; ++j)
+            v += input[in_off + j * s.input_stride[rdim]];
+
+        output[idx] = v;
+    }
+
+    // smallDimReduceCUDA —— 单维归约入口：先合并连续维，再按标量类型派发内核
+    template <typename T>
+    graph::tensorPtr smallDimReduceCUDA(graph::tensorPtr t, const int64_t rdim)
+    {
+        int64_t ndim = static_cast<int64_t>(t->shape().size());
+        if (rdim < 0 || rdim >= ndim)
+            throw std::out_of_range("smallDimReduce: invalid rdim");
+
+        // 输出逻辑形状 = 去掉第 rdim 维
+        base::s_vec out_shape;
+        out_shape.reserve(ndim - 1);
+        for (int64_t i = 0; i < ndim; ++i)
+            if (i != rdim)
+                out_shape.push_back(t->shape()[i]);
+
+        graph::tensorPtr reduced = std::make_shared<graph::TensorImpl>(
+            out_shape, t->type(), t->device(), t->requires_grad());
+
+        int64_t out_numel = reduced->numel();
+        if (out_numel == 0) // 空张量直接返回
+            return reduced;
+
+        // 标记归约维，合并连续非归约维，减少内核里的整除/取模次数
+        std::vector<bool> masked_dims(ndim, false);
+        masked_dims[rdim] = true;
+        auto [new_shape, new_stride, new_reduce_idx] =
             coalesce_dimensions(t->shape(), t->stride(), masked_dims);
-        new_rdim = new_rdim_idx[0];
-        const int32_t *input_dim = new int32_t(new_shape.size()),
-                      output_dim = new int32_t(new_shape.size() - 1),
-                      input_stride = new int32_t(new_shape.size()),
-                      output_stride = new int32_t(new_shape.size() - 1);
+        int64_t new_rdim = new_reduce_idx[0]; // 归约维在合并后坐标系中的下标
 
-        for (int i = 0; i < new_rdim; i++)
+        // 合并后的输出 stride（行主序，去掉归约维）
+        base::s_vec out_stride(new_shape.size() - 1);
+        int64_t step = 1;
+        for (int64_t i = static_cast<int64_t>(new_shape.size()) - 1; i >= 0; --i)
         {
-            input_dim[i] = new_shape[i];
-            output_dim[i] = new_shape[i];
-            input_stride[i] = new_stride[i];
+            if (i == new_rdim)
+                continue;
+            int64_t od = (i < new_rdim) ? i : i - 1;
+            out_stride[od] = step;
+            step *= new_shape[i];
         }
-        input_dim[new_rdim] = new_shape[new_rdim];
-        input_stride[new_rdim] = new_stride[new_rdim];
-        for (int i = new_rdim + 1; i < new_shape.size(); i++)
+
+        // 构造kernel参数
+        SmallReduceKernelDimStride s;
+        for (int64_t i = static_cast<int64_t>(new_shape.size()) - 1; i >= 0; --i)
         {
-            input_dim[i] = new_shape[i];
-            output_dim[i - 1] = new_shape[i];
-            input_stride[i] = new_stride[i];
+            s.input_dim[i] = new_shape[i];
+            s.input_stride[i] = new_stride[i];
+            if (i < static_cast<int64_t>(new_shape.size()) - 1)
+                s.output_stride[i] = out_stride[i];
         }
-        output_stride[output_dim.size() - 1] = 1;
-        for (int i = output_dim.size() - 1; i >= 0; i--)
-            output_stride[i] = output_stride[i + 1] * output_dim[i + 1];
 
         const int BLOCK_SIZE = 1024;
-        int grid_size = (reduced->numel() + BLOCK_SIZE - 1) / BLOCK_SIZE;
-        smallDimReduceKernel<<<grid_size, BLOCK_SIZE>>>(reduced->data().data(), t->data().data(),
-                                                        input_dim, output_dim, input_stride,
-                                                        output_stride, rdim);
+        int grid_size = static_cast<int>(
+            (out_numel + BLOCK_SIZE - 1) / BLOCK_SIZE);
+        CHECK_KERNEL_FUNC(smallDimReduceKernel<T>
+                          <<<grid_size, BLOCK_SIZE>>>(
+                              static_cast<T *>(reduced->data().data()),
+                              static_cast<const T *>(t->data().data()),
+                              out_numel, s, new_rdim,
+                              static_cast<int>(new_shape.size())));
 
         return reduced;
+    }
+
+    graph::tensorPtr smallDimReduce(graph::tensorPtr t, const int64_t rdim)
+    {
+        graph::tensorPtr reduced;
+        base::dispatch(t->type().scalar_type_, t->device(),
+                       [&]<typename T, base::Device Dev>()
+                       {
+                           if constexpr (Dev == base::Device::CUDA)
+                           {
+                               reduced = smallDimReduce(t, rdim);
+                           }
+                           else if constexpr (Dev == base::Device::CPU)
+                           {
+                               reduced = smallDimReduceCPU(t, rdim);
+                           }
+                           else
+                               throw std::runtime_error(
+                                   "smallDimReduce: Unkown Device");
+                       });
     }
 
     graph::tensorPtr SumOpr::operator()(std::vector<graph::tensorPtr> inputs)

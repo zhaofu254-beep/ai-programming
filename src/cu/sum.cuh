@@ -14,6 +14,7 @@
 
 namespace operation
 {
+    std::array<base::s_vec, 3> coalesce_dimensions;
 
     class SumOpr;
     class SumNode : public graph::Node
@@ -34,7 +35,6 @@ namespace operation
                 throw std::invalid_argument("No grad to be backward.");
         }
     };
-
     class SumOpr
     {
     private:
@@ -68,7 +68,6 @@ namespace operation
     public:
         std::vector<graph::tensorPtr> backward();
     };
-
     class ElimentWiseOpr : public Opr
     {
     private:

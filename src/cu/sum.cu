@@ -61,7 +61,7 @@ namespace operation
     }
 
     template <typename T>
-    graph::tensorPtr smallDimReduceCPU(graph::tensorPtr t, const int64_t rdim)
+    graph::tensorPtr smallContigReduceCPU(graph::tensorPtr t, const int64_t rdim)
     {
         base::s_vec out_shape;
         int64_t ndim = t->shape().size();
@@ -103,7 +103,7 @@ namespace operation
         return reduced;
     }
 
-    // smallDimReduceKernel —— 单维归约：每个线程负责一个输出位置，串行累加归约维。
+    // smallContigReduceKernel —— 单维归约：每个线程负责一个输出位置，串行累加归约维。
     // 工作在合并后的维度上（input_dim/input_stride/rdim 均为 coalesce 之后的结果）。
     const int MAX_SMALL_DIM_SIZE = 8;
     struct SmallReduceKernelDimStride
@@ -113,11 +113,11 @@ namespace operation
         int64_t output_stride[MAX_SMALL_DIM_SIZE];
     };
     template <typename T>
-    __global__ void smallDimReduceKernel(T *output, const T *input,
-                                         const int64_t out_numel,
-                                         SmallReduceKernelDimStride s,
-                                         const int64_t rdim,
-                                         const int ndim)
+    __global__ void smallContigReduceKernel(T *output, const T *input,
+                                            const int64_t out_numel,
+                                            SmallReduceKernelDimStride s,
+                                            const int64_t rdim,
+                                            const int ndim)
     {
         int64_t idx = blockDim.x * blockIdx.x + threadIdx.x;
         if (idx >= out_numel)
@@ -141,9 +141,9 @@ namespace operation
         output[idx] = v;
     }
 
-    // smallDimReduceCUDA —— 单维归约入口：先合并连续维，再按标量类型派发内核
+    // smallContigReduceCUDA —— 单维归约入口：先合并连续维，再按标量类型派发内核
     template <typename T>
-    graph::tensorPtr smallDimReduceCUDA(graph::tensorPtr t, const int64_t rdim)
+    graph::tensorPtr smallContigReduceCUDA(graph::tensorPtr t, const int64_t rdim)
     {
         int64_t ndim = static_cast<int64_t>(t->shape().size());
         if (rdim < 0 || rdim >= ndim)
@@ -195,7 +195,7 @@ namespace operation
         const int BLOCK_SIZE = 1024;
         int grid_size = static_cast<int>(
             (out_numel + BLOCK_SIZE - 1) / BLOCK_SIZE);
-        CHECK_KERNEL_FUNC(smallDimReduceKernel<T>
+        CHECK_KERNEL_FUNC(smallContigReduceKernel<T>
                           <<<grid_size, BLOCK_SIZE>>>(
                               static_cast<T *>(reduced->data().data()),
                               static_cast<const T *>(t->data().data()),
@@ -205,7 +205,7 @@ namespace operation
         return reduced;
     }
 
-    graph::tensorPtr smallDimReduce(graph::tensorPtr t, const int64_t rdim)
+    graph::tensorPtr smallContigReduce(graph::tensorPtr t, const int64_t rdim)
     {
         graph::tensorPtr reduced;
         base::dispatch(t->type().scalar_type_, t->device(),
@@ -213,16 +213,62 @@ namespace operation
                        {
                            if constexpr (Dev == base::Device::CUDA)
                            {
-                               reduced = smallDimReduce(t, rdim);
+                               reduced = smallContigReduceCUDA(t, rdim);
                            }
                            else if constexpr (Dev == base::Device::CPU)
                            {
-                               reduced = smallDimReduceCPU(t, rdim);
+                               reduced = smallContigReduceCPU(t, rdim);
                            }
                            else
                                throw std::runtime_error(
-                                   "smallDimReduce: Unkown Device");
+                                   "smallContigReduce: Unkown Device");
                        });
+    }
+
+    template <typename T>
+    __global__ void longTailContigMidReduceKernel(T *output, const T *input,
+                                                  const int64_t in_numel,
+                                                  const int64_t out_numel,
+                                                  const int64_t inputshape[3],
+                                                  const int64_t inputstride[3],
+                                                  const int64_t outputstride[2],
+                                                  const int oneLineBlockNum,
+                                                  const int accumulateStride,
+                                                  const int accumulateNum)
+    {
+        // 归约中间维度
+        // 在inputshape[2]>=32, inputshape[1]>=64(float32)或256(float64)时连续tensor使用
+        // gridDim.x沿着outputshape[1]铺开，gridDim.y代表处理同一批归约的线程的block集合
+        // 一个block中的各个warp对应同样连续的32个位置，分别间隔64(float32)或256(float64)
+        // blockDim.y=maxBlockSize/warp_size,blockDIm.x=warp_size
+
+        int64_t bx = blockIdx.x, by = blockIdx.y;
+        int64_t out0 = bx / oneLineBlockNum, out1 = bx % oneLineBlockNum;
+        int64_t lane = threadIdx.x, warp_idx = threadIdx.y;
+
+        T value = 0;
+
+        if (out1 * blockDim.x + lane < outputshape[1])
+        {
+
+            int64_t start_idx = out0 * inputstride[0] + out1 * blockDim.x +
+                                (warp_idx * blockDIm.x + lane) * inputstride[1];
+
+            int64_t idx = start_idx;
+            for (i = 0; i < accumulateNum; i++)
+            {
+                if (idx < in_numel)
+                    value += input[idx];
+                idx += accumulateStride;
+            }
+        }
+
+        atomicAdd(&output[out0 * outputstride[0] + out1 * oneLineBlockNum + lane], value);
+    }
+
+    template <typename T>
+    graph::tensorPtr longTailContigReduce(graph::tensorPtr t, const int64_t rdim)
+    {
     }
 
     graph::tensorPtr SumOpr::operator()(std::vector<graph::tensorPtr> inputs)

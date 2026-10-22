@@ -14,7 +14,8 @@
 
 namespace operation
 {
-    std::array<base::s_vec, 3> coalesce_dimensions;
+    std::array<base::s_vec, 3> coalesce_dimensions(
+        base::s_vec shape, base::s_vec stride, std::vector<bool> masked_dims);
 
     class SumOpr;
     class SumNode : public graph::Node

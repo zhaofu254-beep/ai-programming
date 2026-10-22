@@ -575,3 +575,5 @@ HW3.md
 src/python/test.py
 tensor_temp.cuh
 tensor_temp.cu
+sumtemp.cuh
+sumtemp.cu

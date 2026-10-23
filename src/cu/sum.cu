@@ -1,5 +1,6 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
+
 #include <cstring>
 #include <cmath>
 #include <cstdlib>
@@ -7,6 +8,9 @@
 #include <stack>
 #include <set>
 #include <algorithm>
+#include <bit>
+#include <cstdint>
+#include <utility>
 
 #include "tensor.cuh"
 #include "sum.cuh"
@@ -359,22 +363,141 @@ namespace operation
         return reduced;
     }
 
+    // shortTailContigMidReduceKernel —— 归约"中间维"、连续尾维较短（<=16）时的 fold 归约：
+    // 把 warp 的 32 个 lane 拆成 (2^fold2exponent) 个 fold × tail_size 个尾位置，
+    // 用多余 fold 覆盖归约维，warp 内 shuffle 合并 fold，跨 warp/block 用 atomicAdd 合并。
     template <typename T>
-    __global__ void longTailContigMidReduceKernel(T *output, const T *input,
-                                                  const int64_t inputshape[3],
-                                                  const int64_t inputstride[3],
-                                                  const int64_t outputstride[2],
-                                                  const size_t fold2exponent,
-                                                  const int accumulateNum)
+    __global__ void shortTailContigMidReduceKernel(T *output, const T *input,
+                                                   const int64_t inputshape[3],
+                                                   const int64_t inputstride[3],
+                                                   const int64_t outputstride[2],
+                                                   const int fold2exponent,
+                                                   const int accumulateNum)
     {
-        // 当最后一维<=16时使用
         int64_t bx = blockIdx.x, by = blockIdx.y;
         int64_t lane = threadIdx.x, warp_idx = threadIdx.y;
 
-        const size_t tail2exponent = 5 - fold2exponent;
-        int fold_idx = lane >> tail2exponent, tail_idx = lane & ((1u << tail2exponent) - 1);
+        const int tail2exp = 5 - fold2exponent;
+        const int tail_size = 1 << tail2exp;
+        int fold_idx = lane >> tail2exp;
+        int tail_idx = lane & (tail_size - 1);
 
-        if ()
+        int64_t warpCover = (int64_t)accumulateNum << fold2exponent;
+        int64_t reduce_start = by * blockDim.y * warpCover +
+                               warp_idx * warpCover +
+                               fold_idx * accumulateNum;
+
+        T v = 0;
+        if (tail_idx < inputshape[2] && reduce_start < inputshape[1])
+        {
+            int64_t idx = bx * inputstride[0] +
+                          reduce_start * inputstride[1] +
+                          tail_idx * inputstride[2];
+            int n = accumulateNum;
+            if (reduce_start + accumulateNum > inputshape[1])
+                n = static_cast<int>(inputshape[1] - reduce_start);
+            for (int i = 0; i < n; ++i)
+            {
+                v += input[idx];
+                idx += inputstride[1]; // 归约维 stride = tail
+            }
+        }
+
+        // 全 warp 参与：合并同一尾位置、不同 fold 的部分和
+        for (int delta = tail_size; delta < 32; delta <<= 1)
+            v += __shfl_down_sync(0xffffffffu, v, delta);
+
+        if (fold_idx == 0 && tail_idx < inputshape[2])
+        {
+            int64_t out_idx = bx * outputstride[0] + tail_idx * outputstride[1];
+            atomicAdd(&output[out_idx], v);
+        }
+    }
+
+    template <typename T>
+    graph::tensorPtr shortTailContigReduceCUDA(graph::tensorPtr t, const int64_t rdim)
+    {
+        int64_t ndim = static_cast<int64_t>(t->shape().size());
+        if (rdim < 0 || rdim >= ndim)
+            throw std::out_of_range("shortTailContigReduce: invalid rdim");
+        if (rdim == ndim - 1)
+            throw std::invalid_argument(
+                "shortTailContigReduce: rdim should not be the last dim");
+
+        // 标记归约维并合并连续非归约维（连续张量 + 中间归约 -> [outer, reduce, tail]）
+        std::vector<bool> mask(ndim, false);
+        mask[rdim] = true;
+        auto coalesced = coalesce_dimensions(t->shape(), t->stride(), mask);
+        base::s_vec shape = coalesced[0];
+        while (shape.size() < 3)
+            shape.insert(shape.begin(), 1);
+
+        const int WARP_SIZE = 32;
+        const int WARP_NUM = 32;
+        const int WARP_ACCUMU_NUM = 256;
+
+        int64_t outer = shape[0], reduce = shape[1], tail = shape[2];
+
+        // tail_size = 最小 2 的幂 >= tail；fold2exp = log2(32/tail_size)
+        int tail_size = 1, tail2exp = 0;
+        while (tail_size < tail) { tail_size <<= 1; ++tail2exp; }
+        int fold2exp = 5 - tail2exp;
+
+        int warpCover = WARP_ACCUMU_NUM << fold2exp; // 每 warp 覆盖的归约元素数
+        int blockCover = WARP_NUM * warpCover;
+        int reduceBlockNum = static_cast<int>(
+            (reduce + blockCover - 1) / blockCover);
+
+        dim3 block(WARP_SIZE, WARP_NUM);
+        dim3 grid(static_cast<unsigned>(outer),
+                  static_cast<unsigned>(reduceBlockNum));
+
+        // 输出形状 = 去掉 rdim
+        base::s_vec out_shape;
+        out_shape.reserve(ndim - 1);
+        for (int64_t i = 0; i < ndim; ++i)
+            if (i != rdim)
+                out_shape.push_back(t->shape()[i]);
+        graph::tensorPtr r = std::make_shared<graph::TensorImpl>(
+            out_shape, t->type(), t->device(), t->requires_grad());
+        r->fill(0); // atomicAdd 累加前先清零
+
+        const int64_t inputshape[3] = {outer, reduce, tail};
+        const int64_t inputstride[3] = {reduce * tail, tail, 1};
+        const int64_t outputstride[2] = {tail, 1};
+
+        CHECK_KERNEL_FUNC(shortTailContigMidReduceKernel<T>
+                          <<<grid, block>>>(
+                              static_cast<T *>(r->data().data()),
+                              static_cast<const T *>(t->data().data()),
+                              inputshape, inputstride, outputstride,
+                              fold2exp, WARP_ACCUMU_NUM));
+
+        return r;
+    }
+
+    graph::tensorPtr shortTailContigReduce(graph::tensorPtr t, const int64_t rdim)
+    {
+        if (!t->data().is_continue())
+            throw(std::invalid_argument("tensor must be continuous!"));
+
+        graph::tensorPtr reduced;
+        base::dispatch(t->type().scalar_type_, t->device(),
+                       [&]<typename T, base::Device Dev>()
+                       {
+                           if constexpr (Dev == base::Device::CUDA)
+                           {
+                               reduced = shortTailContigReduceCUDA<T>(t, rdim);
+                           }
+                           else if constexpr (Dev == base::Device::CPU)
+                           {
+                               reduced = smallContigReduceCPU<T>(t, rdim);
+                           }
+                           else
+                               throw std::runtime_error(
+                                   "shortTailContigReduce: Unkown Device");
+                       });
+        return reduced;
     }
 
     graph::tensorPtr SumOpr::operator()(std::vector<graph::tensorPtr> inputs)

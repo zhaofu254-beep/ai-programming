@@ -23,4 +23,4 @@ target_link_libraries(tensor PUBLIC CUDA::cudart)
 #编译测试的可执行文件
 # add_executable(test_activation tests/test_activation.cpp)
 
-target_link_libraries(test_activation PRIVATE tensor)
+# target_link_libraries(test_activation PRIVATE tensor)

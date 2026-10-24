@@ -65,7 +65,7 @@ namespace operation
     }
 
     template <typename T>
-    graph::tensorPtr smallContigReduceCPU(graph::tensorPtr t, const int64_t rdim)
+    graph::tensorPtr ContigReduceCPU(graph::tensorPtr t, const int64_t rdim)
     {
         base::s_vec out_shape;
         int64_t ndim = t->shape().size();
@@ -73,15 +73,20 @@ namespace operation
         for (int64_t i = 0; i < ndim; ++i)
             if (i != rdim)
                 out_shape.push_back(t->shape()[i]);
+
         graph::tensorPtr reduced = std::make_shared<graph::TensorImpl>(
             out_shape, t->type(), t->device(), t->requires_grad());
+        reduced.fill(0);
+
         base::s_vec coor(ndim, 0);
         int64_t reduced_idx = 0;
         T *reduced_data = static_cast<T *>(reduced->data().data());
         T *t_data = static_cast<T *>(t->data().data());
+
         for (int n = 0; n < reduced->numel(); n++)
         {
             reduced_idx += reduced->stride()[ndim - 2];
+
             coor[ndim - 2] += 1;
             for (int i = ndim - 2; i >= 0; i--)
             {
@@ -95,15 +100,18 @@ namespace operation
                 else
                     break;
             }
+
             int64_t t_idx = 0;
             for (int i = 0; i < ndim - 1; i++)
                 t_idx += coor[i] * t->stride()[i];
+
             for (int i = 0; i < t->shape()[rdim]; i++)
             {
                 reduced_data[reduced_idx] += t_data[t_idx];
                 t_idx += t->stride()[rdim];
             }
         }
+
         return reduced;
     }
 
@@ -221,7 +229,7 @@ namespace operation
                            }
                            else if constexpr (Dev == base::Device::CPU)
                            {
-                               reduced = smallContigReduceCPU<T>(t, rdim);
+                               reduced = ContigReduceCPU<T>(t, rdim);
                            }
                            else
                                throw std::runtime_error(
@@ -354,7 +362,7 @@ namespace operation
                            else if constexpr (Dev == base::Device::CPU)
                            {
                                // CPU 统一用一套算法了。
-                               reduced = smallContigReduceCPU<T>(t, rdim);
+                               reduced = ContigReduceCPU<T>(t, rdim);
                            }
                            else
                                throw std::runtime_error(
@@ -440,7 +448,11 @@ namespace operation
 
         // tail_size = 最小 2 的幂 >= tail；fold2exp = log2(32/tail_size)
         int tail_size = 1, tail2exp = 0;
-        while (tail_size < tail) { tail_size <<= 1; ++tail2exp; }
+        while (tail_size < tail)
+        {
+            tail_size <<= 1;
+            ++tail2exp;
+        }
         int fold2exp = 5 - tail2exp;
 
         int warpCover = WARP_ACCUMU_NUM << fold2exp; // 每 warp 覆盖的归约元素数
@@ -478,9 +490,6 @@ namespace operation
 
     graph::tensorPtr shortTailContigReduce(graph::tensorPtr t, const int64_t rdim)
     {
-        if (!t->data().is_continue())
-            throw(std::invalid_argument("tensor must be continuous!"));
-
         graph::tensorPtr reduced;
         base::dispatch(t->type().scalar_type_, t->device(),
                        [&]<typename T, base::Device Dev>()
@@ -491,13 +500,120 @@ namespace operation
                            }
                            else if constexpr (Dev == base::Device::CPU)
                            {
-                               reduced = smallContigReduceCPU<T>(t, rdim);
+                               reduced = ContigReduceCPU<T>(t, rdim);
                            }
                            else
                                throw std::runtime_error(
                                    "shortTailContigReduce: Unkown Device");
                        });
         return reduced;
+    }
+
+    template <typename T>
+    __global__ void lastDimContigReduceKernel(T *output, const T *input,
+                                              int64_t outputlength,
+                                              int64_t reducelength)
+    {
+        int outidx = blockIdx.x, reduceidx = blockIdx.y;
+        int warp_idx = threadIdx.x, lane = threadIdx.y;
+
+        const WARP_SIZE = 32;
+        extern __shared__ T reduced[]; // 大小为blockDim.y
+        const int accumulateNum = 256;
+
+        T v = 0;
+        if (outidx < outputlength)
+        {
+
+            int64_t start_pos = reduceidx * WARP_SIZE * blockDim.y +
+                                outidx * reducelength + warp_idx * WARP_SIZE + lane;
+            int64_t end_pos = (outidx + 1) * reducelength;
+            int64_t step = accumulateNum * WARP_SIZE * blockDim.y * gridDim.y;
+
+            while (start_pos < end_pos)
+            {
+                v += input[start_pos];
+                start_pos += step;
+            }
+        }
+        for (int delta = 1; delta < 32; delta <<= 1)
+            v += __shfl_down_sync(0xffffffffu, v, delta);
+        if (lane == 0)
+            reduced[warp_idx] = v;
+        __syncthreads();
+
+        if (warp_idx == 0 && lane == 0)
+        {
+            sum = 0;
+            for (int i = 0; i < blockDim.y; i++)
+                sum += reduced[i];
+            atomicAdd(&output[outidx], sum);
+        }
+    }
+
+    template <typename T>
+    graph::tensorPtr lastDimContigReduceCUDA(graph::tensorPtr t)
+    {
+        int64_t ndim = static_cast<int64_t>(t->shape().size());
+
+        std::vector<bool> mask(ndim, false);
+        mask[ndim - 1] = true;
+        auto coalesced = coalesce_dimensions(t->shape(), t->stride(), mask);
+        base::s_vec shape = coalesced[0];
+        while (shape.size() == 1)
+            shape.insert(shape.begin(), 1);
+
+        base::s_vec out_shape;
+        out_shape.reserve(ndim - 1);
+        for (int64_t i = 0; i < ndim; ++i)
+            if (i != ndim)
+                out_shape.push_back(t->shape()[i]);
+        graph::tensorPtr r = std::make_shared<graph::TensorImpl>(
+            out_shape, t->type(), t->device(), t->requires_grad());
+        r->fill(0); // atomicAdd 累加前先清零
+
+        const int WARP_SIZE = 32;
+        const int WARP_NUM = 32;
+        const int WARP_ACCUMU_NUM = 256;
+
+        int64_t reduceBlockNum = (shape[1] + WARP_SIZE * WARP_NUM * WARP_ACCUMU_NUM - 1) /
+                                 WARP_SIZE * WARP_NUM * WARP_ACCUMU_NUM;
+
+        dim3 block(WARP_SIZE, WARP_NUM);
+        dim3 grid(static_cast<unsigned>(shape[0]),
+                  static_cast<unsigned>(reduceBlockNum));
+
+        lastDimContigReduceKernel<<<grid, block, WARP_NUM>>>(r->data().data(),
+                                                             t->data().data(),
+                                                             shape[0], shape[1]);
+
+        return r;
+    }
+
+    graph::tensorPtr lastDimContigReduce(graph::tensorPtr t)
+    {
+        graph::tensorPtr reduced;
+        base::dispatch(t->type().scalar_type_, t->device(),
+                       [&]<typename T, base::Device Dev>()
+                       {
+                           if constexpr (Dev == base::Device::CUDA)
+                           {
+                               reduced = lastDimContigReduceCUDA<T>(t);
+                           }
+                           else if constexpr (Dev == base::Device::CPU)
+                           {
+                               reduced = ContigReduceCPU<T>(t, t->shape().size() - 1);
+                           }
+                           else
+                               throw std::runtime_error(
+                                   "lastDimContigReduce: Unkown Device");
+                       });
+        return reduced;
+    }
+
+    graph::tensorPtr contigReduce(graph::tensorPtr t, const int64_t rdim)
+    {
+        
     }
 
     graph::tensorPtr SumOpr::operator()(std::vector<graph::tensorPtr> inputs)

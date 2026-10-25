@@ -21,9 +21,11 @@ namespace operation
     class SumNode : public graph::Node
     {
     private:
-        base::s_vec inputStrides, inputShape, dims;
+        base::s_vec inputStrides, inputShape;
+        const int rdim_;
 
-        SumNode(std::vector<graph::tensorPtr> adds) : Node(1, 1)
+        SumNode(std::vector<graph::tensorPtr> adds, int rdim)
+            : Node(1, 1), rdim_(rdim)
         {
             next_edges_[0] = {adds[0]->autograd().grad_fn_, 0};
         }
@@ -39,16 +41,16 @@ namespace operation
     class SumOpr
     {
     private:
-        base::s_vec dims_;
-        std::shared_ptr<graph::Node> makeNode(std::vector<graph::tensorPtr> inputs)
+        std::shared_ptr<graph::Node> makeNode(
+            std::vector<graph::tensorPtr> inputs, int rdim)
         {
-            return std::shared_ptr<graph::Node>(new SumNode(inputs));
+            return std::shared_ptr<graph::Node>(new SumNode(inputs, rdim));
         }
 
     public:
         bool broadcastingSupport() { return false; }
-        void setDims(base::s_vec dims) { dims_ = dims; }
-        graph::tensorPtr operator()(std::vector<graph::tensorPtr> inputs);
+        graph::tensorPtr operator()(
+            std::vector<graph::tensorPtr> inputs, int rdim = -1);
     };
 
     class ElimentWiseOpr;

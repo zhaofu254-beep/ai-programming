@@ -242,12 +242,12 @@ namespace operation
     // 每个 warp 沿连续尾维铺 32 个位置，block 内多个 warp 沿归约维按 accumulateNum 分块，
     // gridDim.y 再沿归约维分批。inputshape = [outer, reduce, tail]。
     template <typename T>
-    __global__ void longTailContigMidReduceKernel(T *output, const T *input,
-                                                  const int64_t inputshape[3],
-                                                  const int64_t inputstride[3],
-                                                  const int64_t outputstride[2],
-                                                  const int oneLineBlockNum,
-                                                  const int accumulateNum)
+    __global__ void longTailContigReduceKernel(T *output, const T *input,
+                                               const int64_t inputshape[3],
+                                               const int64_t inputstride[3],
+                                               const int64_t outputstride[2],
+                                               const int oneLineBlockNum,
+                                               const int accumulateNum)
     {
         int64_t bx = blockIdx.x, by = blockIdx.y;
         int64_t out0 = bx / oneLineBlockNum, out1 = bx % oneLineBlockNum;
@@ -336,7 +336,7 @@ namespace operation
         const int64_t outputstride[2] = {tail, 1};
         int shared_bytes = BLOCK_DIM_Y * WARP_SIZE * sizeof(T);
 
-        CHECK_KERNEL_FUNC(longTailContigMidReduceKernel<T>
+        CHECK_KERNEL_FUNC(longTailContigReduceKernel<T>
                           <<<grid, block, shared_bytes>>>(
                               static_cast<T *>(r->data().data()),
                               static_cast<const T *>(t->data().data()),
@@ -375,12 +375,12 @@ namespace operation
     // 把 warp 的 32 个 lane 拆成 (2^fold2exponent) 个 fold × tail_size 个尾位置，
     // 用多余 fold 覆盖归约维，warp 内 shuffle 合并 fold，跨 warp/block 用 atomicAdd 合并。
     template <typename T>
-    __global__ void shortTailContigMidReduceKernel(T *output, const T *input,
-                                                   const int64_t inputshape[3],
-                                                   const int64_t inputstride[3],
-                                                   const int64_t outputstride[2],
-                                                   const int fold2exponent,
-                                                   const int accumulateNum)
+    __global__ void shortTailContigReduceKernel(T *output, const T *input,
+                                                const int64_t inputshape[3],
+                                                const int64_t inputstride[3],
+                                                const int64_t outputstride[2],
+                                                const int fold2exponent,
+                                                const int accumulateNum)
     {
         int64_t bx = blockIdx.x, by = blockIdx.y;
         int64_t lane = threadIdx.x, warp_idx = threadIdx.y;
@@ -478,7 +478,7 @@ namespace operation
         const int64_t inputstride[3] = {reduce * tail, tail, 1};
         const int64_t outputstride[2] = {tail, 1};
 
-        CHECK_KERNEL_FUNC(shortTailContigMidReduceKernel<T>
+        CHECK_KERNEL_FUNC(shortTailContigReduceKernel<T>
                           <<<grid, block>>>(
                               static_cast<T *>(r->data().data()),
                               static_cast<const T *>(t->data().data()),
@@ -611,12 +611,50 @@ namespace operation
         return reduced;
     }
 
-    graph::tensorPtr contigReduce(graph::tensorPtr t, const int64_t rdim)
+    graph::tensorPtr contigReduce(graph::tensorPtr t, int64_t rdim = -1)
     {
-        
+        if (rdim < -1 || rdim >= t->shape().size())
+            throw(std::invalid_argument("Rdim Out of Range"));
+
+        if (!t->data().is_continue())
+            throw(std::invalid_argument("Tensor Must Be Continuous"));
+
+        rdim = (rdim == -1) ? t->shape().size() - 1 : rdim;
+
+        const size_t MAX_SMALL_DIM_SIZE = 256;
+        if (t->shape()[rdim] < MAX_SMALL_DIM_SIZE)
+        {
+            return smallContigReduce(t, rdim);
+        }
+
+        else if (rdim == t->shape().size() - 1)
+        {
+            return lastDimContigReduce(t);
+        }
+
+        else
+        {
+            const size_t MAX_SHORT_TAIL_SIZE = 32;
+            if (t->stride()[rdim] >= MAX_SHORT_TAIL_SIZE)
+            {
+                return longTailContigReduce(t, rdim);
+            }
+            else
+            {
+                return shortTailContigReduce(t, rdim);
+            }
+        }
     }
 
-    graph::tensorPtr SumOpr::operator()(std::vector<graph::tensorPtr> inputs)
+    graph::tensorPtr SumOpr::operator()(
+        std::vector<graph::tensorPtr> inputs, int rdim = -1)
     {
+        graph::tensorPtr r = contigReduce(inputs[0], rdim);
+
+        std::shared_ptr<graph::Node> node = makeNode(inputs, rdim);
+
+        r->autograd().grad_fn_ = node;
+
+        return r;
     }
 }

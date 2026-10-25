@@ -67,8 +67,8 @@ namespace operation
     template <typename T>
     graph::tensorPtr ContigReduceCPU(graph::tensorPtr t, const int64_t rdim)
     {
+        int64_t ndim = static_cast<int64_t>(t->shape().size());
         base::s_vec out_shape;
-        int64_t ndim = t->shape().size();
         out_shape.reserve(ndim - 1);
         for (int64_t i = 0; i < ndim; ++i)
             if (i != rdim)
@@ -76,40 +76,33 @@ namespace operation
 
         graph::tensorPtr reduced = std::make_shared<graph::TensorImpl>(
             out_shape, t->type(), t->device(), t->requires_grad());
-        reduced.fill(0);
+        reduced->fill(0);
 
-        base::s_vec coor(ndim, 0);
-        int64_t reduced_idx = 0;
         T *reduced_data = static_cast<T *>(reduced->data().data());
-        T *t_data = static_cast<T *>(t->data().data());
+        const T *t_data = static_cast<const T *>(t->data().data());
+        const base::s_vec &shape = t->shape();
+        const base::s_vec &stride = t->stride();
+        int64_t out_numel = reduced->numel();
+        int64_t reduce_len = shape[rdim];
+        int64_t reduce_stride = stride[rdim];
 
-        for (int n = 0; n < reduced->numel(); n++)
+        // 每个输出元素 n：反解输出坐标（跳过 rdim）得到输入基偏移，再沿 rdim 累加
+        for (int64_t n = 0; n < out_numel; ++n)
         {
-            reduced_idx += reduced->stride()[ndim - 2];
-
-            coor[ndim - 2] += 1;
-            for (int i = ndim - 2; i >= 0; i--)
-            {
-                if (coor[i] >= reduced->shape()[i])
-                {
-                    coor[i] = 0;
-                    coor[i - 1] += 1;
-                    reduced_idx -= reduced->shape()[i] * reduced->stride()[i];
-                    reduced_idx += reduced->stride()[i - 1];
-                }
-                else
-                    break;
-            }
-
+            int64_t rem = n;
             int64_t t_idx = 0;
-            for (int i = 0; i < ndim - 1; i++)
-                t_idx += coor[i] * t->stride()[i];
-
-            for (int i = 0; i < t->shape()[rdim]; i++)
+            for (int64_t d = ndim - 1; d >= 0; --d)
             {
-                reduced_data[reduced_idx] += t_data[t_idx];
-                t_idx += t->stride()[rdim];
+                if (d == rdim)
+                    continue;
+                int64_t c = rem % shape[d];
+                rem /= shape[d];
+                t_idx += c * stride[d];
             }
+            T v = 0;
+            for (int64_t k = 0; k < reduce_len; ++k)
+                v += t_data[t_idx + k * reduce_stride];
+            reduced_data[n] = v;
         }
 
         return reduced;
@@ -514,39 +507,35 @@ namespace operation
                                               int64_t outputlength,
                                               int64_t reducelength)
     {
-        int outidx = blockIdx.x, reduceidx = blockIdx.y;
-        int warp_idx = threadIdx.x, lane = threadIdx.y;
+        int outidx = blockIdx.x;
+        int lane = threadIdx.x, warp_idx = threadIdx.y;
 
-        const WARP_SIZE = 32;
-        extern __shared__ T reduced[]; // 大小为blockDim.y
-        const int accumulateNum = 256;
+        // 全 grid 扁平线程号，沿归约维做 grid-stride
+        int64_t total_threads = (int64_t)blockDim.x * blockDim.y * gridDim.y;
+        int64_t start = ((int64_t)blockIdx.y * blockDim.y + warp_idx) * blockDim.x + lane;
 
         T v = 0;
         if (outidx < outputlength)
         {
-
-            int64_t start_pos = reduceidx * WARP_SIZE * blockDim.y +
-                                outidx * reducelength + warp_idx * WARP_SIZE + lane;
-            int64_t end_pos = (outidx + 1) * reducelength;
-            int64_t step = accumulateNum * WARP_SIZE * blockDim.y * gridDim.y;
-
-            while (start_pos < end_pos)
-            {
-                v += input[start_pos];
-                start_pos += step;
-            }
+            int64_t base = outidx * reducelength;
+            for (int64_t r = start; r < reducelength; r += total_threads)
+                v += input[base + r];
         }
-        for (int delta = 1; delta < 32; delta <<= 1)
+
+        // warp 内 shuffle 归约
+        for (int delta = 16; delta > 0; delta >>= 1)
             v += __shfl_down_sync(0xffffffffu, v, delta);
+
+        extern __shared__ T reduced[]; // blockDim.y 个 T
         if (lane == 0)
             reduced[warp_idx] = v;
         __syncthreads();
 
         if (warp_idx == 0 && lane == 0)
         {
-            sum = 0;
-            for (int i = 0; i < blockDim.y; i++)
-                sum += reduced[i];
+            T sum = 0;
+            for (int w = 0; w < blockDim.y; ++w)
+                sum += reduced[w];
             atomicAdd(&output[outidx], sum);
         }
     }
@@ -560,32 +549,35 @@ namespace operation
         mask[ndim - 1] = true;
         auto coalesced = coalesce_dimensions(t->shape(), t->stride(), mask);
         base::s_vec shape = coalesced[0];
-        while (shape.size() == 1)
-            shape.insert(shape.begin(), 1);
+        if (shape.size() == 1)
+            shape.insert(shape.begin(), 1); // [reduce] -> [1, reduce]
 
+        int64_t outer = shape[0], reduce = shape[1];
+
+        // 输出形状 = 去掉最后一维
         base::s_vec out_shape;
         out_shape.reserve(ndim - 1);
-        for (int64_t i = 0; i < ndim; ++i)
-            if (i != ndim)
-                out_shape.push_back(t->shape()[i]);
+        for (int64_t i = 0; i < ndim - 1; ++i)
+            out_shape.push_back(t->shape()[i]);
         graph::tensorPtr r = std::make_shared<graph::TensorImpl>(
             out_shape, t->type(), t->device(), t->requires_grad());
         r->fill(0); // atomicAdd 累加前先清零
 
         const int WARP_SIZE = 32;
         const int WARP_NUM = 32;
-        const int WARP_ACCUMU_NUM = 256;
-
-        int64_t reduceBlockNum = (shape[1] + WARP_SIZE * WARP_NUM * WARP_ACCUMU_NUM - 1) /
-                                 WARP_SIZE * WARP_NUM * WARP_ACCUMU_NUM;
+        int64_t threads_per_block = WARP_SIZE * WARP_NUM;
+        int reduceBlockNum = static_cast<int>(
+            (reduce + threads_per_block - 1) / threads_per_block);
 
         dim3 block(WARP_SIZE, WARP_NUM);
-        dim3 grid(static_cast<unsigned>(shape[0]),
+        dim3 grid(static_cast<unsigned>(outer),
                   static_cast<unsigned>(reduceBlockNum));
 
-        lastDimContigReduceKernel<<<grid, block, WARP_NUM>>>(r->data().data(),
-                                                             t->data().data(),
-                                                             shape[0], shape[1]);
+        CHECK_KERNEL_FUNC(lastDimContigReduceKernel<T>
+                          <<<grid, block, WARP_NUM * sizeof(T)>>>(
+                              static_cast<T *>(r->data().data()),
+                              static_cast<const T *>(t->data().data()),
+                              outer, reduce));
 
         return r;
     }
@@ -613,7 +605,7 @@ namespace operation
 
     graph::tensorPtr contigReduce(graph::tensorPtr t, int64_t rdim = -1)
     {
-        if (rdim < -1 || rdim >= t->shape().size())
+        if (rdim < -1 || rdim >= static_cast<int64_t>(t->shape().size()))
             throw(std::invalid_argument("Rdim Out of Range"));
 
         if (!t->data().is_continue())
@@ -647,7 +639,7 @@ namespace operation
     }
 
     graph::tensorPtr SumOpr::operator()(
-        std::vector<graph::tensorPtr> inputs, int rdim = -1)
+        std::vector<graph::tensorPtr> inputs, int rdim)
     {
         graph::tensorPtr r = contigReduce(inputs[0], rdim);
 

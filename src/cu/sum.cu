@@ -235,14 +235,20 @@ namespace operation
         return reduced;
     }
 
+    // forward reduce kernel 的 dim/stride 参数（按值传，避免把 host 指针传给 device）
+    struct ContigReduceDimStride
+    {
+        int64_t input_shape[3];
+        int64_t input_stride[3];
+        int64_t output_stride[2];
+    };
+
     // longTailContigMidReduceKernel —— 归约"中间维"（连续张量，归约维非尾维）：
     // 每个 warp 沿连续尾维铺 32 个位置，block 内多个 warp 沿归约维按 accumulateNum 分块，
-    // gridDim.y 再沿归约维分批。inputshape = [outer, reduce, tail]。
+    // gridDim.y 再沿归约维分批。input_shape = [outer, reduce, tail]。
     template <typename T>
     __global__ void longTailContigReduceKernel(T *output, const T *input,
-                                               const int64_t inputshape[3],
-                                               const int64_t inputstride[3],
-                                               const int64_t outputstride[2],
+                                               ContigReduceDimStride s,
                                                const int oneLineBlockNum,
                                                const int accumulateNum)
     {
@@ -257,30 +263,30 @@ namespace operation
         laneValues[warp_idx * 32 + lane] = 0;
         __syncthreads();
 
-        if (tail_pos < inputshape[2] && reduce_start < inputshape[1])
+        if (tail_pos < s.input_shape[2] && reduce_start < s.input_shape[1])
         {
-            int64_t idx = out0 * inputstride[0] +
-                          reduce_start * inputstride[1] +
-                          tail_pos * inputstride[2];
+            int64_t idx = out0 * s.input_stride[0] +
+                          reduce_start * s.input_stride[1] +
+                          tail_pos * s.input_stride[2];
             T value = 0;
             int n = accumulateNum;
-            if (reduce_start + accumulateNum > inputshape[1])
-                n = static_cast<int>(inputshape[1] - reduce_start);
+            if (reduce_start + accumulateNum > s.input_shape[1])
+                n = static_cast<int>(s.input_shape[1] - reduce_start);
             for (int i = 0; i < n; ++i)
             {
                 value += input[idx];
-                idx += inputstride[1]; // 归约维 stride = tail
+                idx += s.input_stride[1]; // 归约维 stride = tail
             }
             laneValues[warp_idx * 32 + lane] = value;
         }
         __syncthreads();
 
-        if (warp_idx == 0 && tail_pos < inputshape[2])
+        if (warp_idx == 0 && tail_pos < s.input_shape[2])
         {
             T sum = 0;
             for (int w = 0; w < blockDim.y; ++w)
                 sum += laneValues[w * 32 + lane];
-            int64_t out_idx = out0 * outputstride[0] + tail_pos * outputstride[1];
+            int64_t out_idx = out0 * s.output_stride[0] + tail_pos * s.output_stride[1];
             atomicAdd(&output[out_idx], sum);
         }
     }
@@ -328,17 +334,14 @@ namespace operation
             out_shape, t->type(), t->device(), t->requires_grad());
         r->fill(0); // atomicAdd 累加前先清零
 
-        const int64_t inputshape[3] = {outer, reduce, tail};
-        const int64_t inputstride[3] = {reduce * tail, tail, 1};
-        const int64_t outputstride[2] = {tail, 1};
+        ContigReduceDimStride s{{outer, reduce, tail}, {reduce * tail, tail, 1}, {tail, 1}};
         int shared_bytes = BLOCK_DIM_Y * WARP_SIZE * sizeof(T);
 
         CHECK_KERNEL_FUNC(longTailContigReduceKernel<T>
                           <<<grid, block, shared_bytes>>>(
                               static_cast<T *>(r->data().data()),
                               static_cast<const T *>(t->data().data()),
-                              inputshape, inputstride, outputstride,
-                              oneLineBlockNum, WARP_ACCUMU_NUM));
+                              s, oneLineBlockNum, WARP_ACCUMU_NUM));
 
         return r;
     }
@@ -377,9 +380,7 @@ namespace operation
     // 用多余 fold 覆盖归约维，warp 内 shuffle 合并 fold，跨 warp/block 用 atomicAdd 合并。
     template <typename T>
     __global__ void shortTailContigReduceKernel(T *output, const T *input,
-                                                const int64_t inputshape[3],
-                                                const int64_t inputstride[3],
-                                                const int64_t outputstride[2],
+                                                ContigReduceDimStride s,
                                                 const int fold2exponent,
                                                 const int accumulateNum)
     {
@@ -397,18 +398,18 @@ namespace operation
                                fold_idx * accumulateNum;
 
         T v = 0;
-        if (tail_idx < inputshape[2] && reduce_start < inputshape[1])
+        if (tail_idx < s.input_shape[2] && reduce_start < s.input_shape[1])
         {
-            int64_t idx = bx * inputstride[0] +
-                          reduce_start * inputstride[1] +
-                          tail_idx * inputstride[2];
+            int64_t idx = bx * s.input_stride[0] +
+                          reduce_start * s.input_stride[1] +
+                          tail_idx * s.input_stride[2];
             int n = accumulateNum;
-            if (reduce_start + accumulateNum > inputshape[1])
-                n = static_cast<int>(inputshape[1] - reduce_start);
+            if (reduce_start + accumulateNum > s.input_shape[1])
+                n = static_cast<int>(s.input_shape[1] - reduce_start);
             for (int i = 0; i < n; ++i)
             {
                 v += input[idx];
-                idx += inputstride[1]; // 归约维 stride = tail
+                idx += s.input_stride[1]; // 归约维 stride = tail
             }
         }
 
@@ -416,9 +417,9 @@ namespace operation
         for (int delta = tail_size; delta < 32; delta <<= 1)
             v += __shfl_down_sync(0xffffffffu, v, delta);
 
-        if (fold_idx == 0 && tail_idx < inputshape[2])
+        if (fold_idx == 0 && tail_idx < s.input_shape[2])
         {
-            int64_t out_idx = bx * outputstride[0] + tail_idx * outputstride[1];
+            int64_t out_idx = bx * s.output_stride[0] + tail_idx * s.output_stride[1];
             atomicAdd(&output[out_idx], v);
         }
     }
@@ -475,16 +476,13 @@ namespace operation
             out_shape, t->type(), t->device(), t->requires_grad());
         r->fill(0); // atomicAdd 累加前先清零
 
-        const int64_t inputshape[3] = {outer, reduce, tail};
-        const int64_t inputstride[3] = {reduce * tail, tail, 1};
-        const int64_t outputstride[2] = {tail, 1};
+        ContigReduceDimStride s{{outer, reduce, tail}, {reduce * tail, tail, 1}, {tail, 1}};
 
         CHECK_KERNEL_FUNC(shortTailContigReduceKernel<T>
                           <<<grid, block>>>(
                               static_cast<T *>(r->data().data()),
                               static_cast<const T *>(t->data().data()),
-                              inputshape, inputstride, outputstride,
-                              fold2exp, WARP_ACCUMU_NUM));
+                              s, fold2exp, WARP_ACCUMU_NUM));
 
         return r;
     }

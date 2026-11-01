@@ -21,13 +21,11 @@ namespace operation
     class SumNode : public graph::Node
     {
     private:
-        const base::s_vec inputStride_, inputShape_, outputStride_, outputShape_;
+        const base::s_vec inputShape_;
         const int rdim_;
 
         SumNode(graph::tensorPtr input, graph::tensorPtr output, int rdim)
-            : Node(1, 1), rdim_(rdim), inputShape_(input->shape()),
-              inputStride_(input->stride()), outputShape_(output->shape()),
-              outputStride_(output->stride())
+            : Node(1, 1), rdim_(rdim), inputShape_(input->shape())
         {
             // 叶子张量的 grad_fn_ 为 null，此时边应指向其 accumulator_（AccumulateGrad）
             std::shared_ptr<graph::Node> input_grad_fn = input->autograd().grad_fn_;

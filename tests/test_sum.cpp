@@ -11,14 +11,14 @@ int main()
     graph::TensorImpl x({2, 4, 3, 3}, base::TypeMeta(base::ScalarType::Float), base::Device::CPU);
 
     // 验证切片，按索引赋值可行
-    float v = x[0][1][2][1].get(); // 索引数 == 维数 → 元素
-    x[0][1][2][1].set(3.14f);      // 写元素
+    float value = x[0][1][2][1].get(); // 索引数 == 维数 → 元素
+    x[0][1][2][1].set(3.14f);          // 写元素
     x[0][1][2][2].set(3.14f);
     x[0][1][1][0].set(3.14f);
     x[0][1][1][1].set(3.14f);
 
-    graph::TensorImpl s = x[0].slice();                           // 索引数 < 维数 → 切片（共享 storage，requires_grad=false）
-    std::cout << "s[1][2][1]: " << s[1][2][1].get() << std::endl; // 在切片上继续索引
+    graph::TensorImpl slice = x[0].slice();                               // 索引数 < 维数 → 切片（共享 storage，requires_grad=false）
+    std::cout << "slice[1][2][1]: " << slice[1][2][1].get() << std::endl; // 在切片上继续索引
 
     std::cout << "x: " << std::endl;
     x.print();
@@ -36,21 +36,51 @@ int main()
     // 叶子张量需在算子之前设置 accumulator，反向时梯度才能累积到 t.grad_
     t->autograd().accumulator_ = std::make_shared<graph::AccumulateGrad>(t);
 
-    operation::SumOpr sumopr;
-    auto y = sumopr({t}, 1);
+    operation::SumOpr sumopr1;
+    auto y = sumopr1({t}, 1);
     std::cout << "sum(t,dim=1): " << std::endl;
     y->print();
     std::cout << "y.grad_fn "
               << ((y->autograd().grad_fn_ != nullptr) ? "exist" : "not exist") << std::endl;
 
     // 验证cpu的sum反向可行
-    graph::Engine engine;
-    auto z = sumopr({y}, 1);
+    graph::Engine engine1;
+    auto z = sumopr1({y}, 1);
 
-    engine.backward(z);
+    engine1.backward(z);
     std::cout << "t.grad_: "
               << ((t->autograd().grad_ != nullptr) ? "exist" : "not exist") << std::endl;
     t->autograd().grad_->print();
+
+    //=====================================================================================
+    // 验证cpu的sum前向可行
+    graph::tensorPtr s = std::make_shared<graph::TensorImpl>(
+        base::s_vec{2, 4, 3, 3}, base::TypeMeta(base::ScalarType::Float),
+        base::Device::CUDA, true);
+
+    (*s)[0][1][2][1].set(3.14f);
+    (*s)[0][1][2][2].set(3.14f);
+    (*s)[0][1][1][0].set(3.14f);
+    (*s)[0][1][1][1].set(3.14f);
+
+    // 叶子张量需在算子之前设置 accumulator，反向时梯度才能累积到 t.grad_
+    s->autograd().accumulator_ = std::make_shared<graph::AccumulateGrad>(s);
+
+    operation::SumOpr sumopr2;
+    auto u = sumopr2({s}, 1);
+    std::cout << "sum(s,dim=1): " << std::endl;
+    u->print();
+    std::cout << "u.grad_fn "
+              << ((u->autograd().grad_fn_ != nullptr) ? "exist" : "not exist") << std::endl;
+
+    // 验证cpu的sum反向可行
+    graph::Engine engine2;
+    auto v = sumopr2({u}, 1);
+
+    engine2.backward(v);
+    std::cout << "s.grad_: "
+              << ((s->autograd().grad_ != nullptr) ? "exist" : "not exist") << std::endl;
+    s->autograd().grad_->print();
 
     return 0;
 }

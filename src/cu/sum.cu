@@ -702,12 +702,19 @@ namespace operation
         return next;
     }
 
+    // 定长结构体按值传给 kernel（避免把 host 指针传给 device）
+    const int MAX_BACKWARD_DIM = 8;
+    struct BackwardKernelDimStride
+    {
+        int64_t next_shape[MAX_BACKWARD_DIM];
+        int64_t prev_stride[MAX_BACKWARD_DIM];
+    };
+
     template <typename T>
     __global__ void sumBackWardKernel(const T *prev_grad, T *next_grad,
                                       int64_t next_numel,
                                       const int next_ndim,
-                                      const int64_t next_shape[],
-                                      const int64_t prev_stride[],
+                                      BackwardKernelDimStride s,
                                       const int64_t rdim)
     {
         int64_t idx = blockDim.x * blockIdx.x + threadIdx.x;
@@ -718,10 +725,10 @@ namespace operation
         int64_t prev_idx = 0;
         for (int d = next_ndim - 1; d >= 0; --d)
         {
-            int64_t c = rem % next_shape[d];
-            rem /= next_shape[d];
+            int64_t c = rem % s.next_shape[d];
+            rem /= s.next_shape[d];
             if (d != rdim)
-                prev_idx += c * prev_stride[(d < rdim) ? d : d - 1];
+                prev_idx += c * s.prev_stride[(d < rdim) ? d : d - 1];
         }
         next_grad[idx] = prev_grad[prev_idx];
     }
@@ -746,8 +753,11 @@ namespace operation
             step *= prev->shape()[d];
         }
 
-        std::vector<int64_t> next_shape_arr(next_shape.begin(), next_shape.end());
-        std::vector<int64_t> prev_stride_arr(prev_stride.begin(), prev_stride.end());
+        BackwardKernelDimStride s{};
+        for (int64_t i = 0; i < static_cast<int64_t>(next_shape.size()); ++i)
+            s.next_shape[i] = next_shape[i];
+        for (int64_t i = 0; i < prev_ndim; ++i)
+            s.prev_stride[i] = prev_stride[i];
 
         int64_t next_numel = next->numel();
         int next_ndim = static_cast<int>(next_shape.size());
@@ -759,8 +769,7 @@ namespace operation
                           <<<grid_size, BLOCK_SIZE>>>(
                               static_cast<const T *>(prev->data().data()),
                               static_cast<T *>(next->data().data()),
-                              next_numel, next_ndim,
-                              next_shape_arr.data(), prev_stride_arr.data(), rdim));
+                              next_numel, next_ndim, s, rdim));
 
         return next;
     }

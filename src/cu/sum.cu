@@ -11,6 +11,7 @@
 #include <bit>
 #include <cstdint>
 #include <utility>
+#include <type_traits>
 
 #include "tensor.cuh"
 #include "sum.cuh"
@@ -18,6 +19,9 @@
 namespace operation
 {
     // 实现算子
+
+    // 动态共享内存的原始声明（供归约 kernel 内 reinterpret_cast 使用）
+    extern __shared__ char shared_mem[];
 
     // coalesce_dimensions —— 合并相邻且连续（stride[i] == stride[i+1]*shape[i+1]）的非归约维；
     // 返回 {new_shape, new_stride, new_masked_dims_idx}（归约维在新坐标系中的下标）。
@@ -249,7 +253,7 @@ namespace operation
         int64_t tail_pos = out1 * 32 + lane;
         int64_t reduce_start = (by * blockDim.y + warp_idx) * accumulateNum;
 
-        extern __shared__ T laneValues[]; // blockDim.y * 32 个 T
+        T *laneValues = reinterpret_cast<T *>(shared_mem); // blockDim.y * 32 个 T
         laneValues[warp_idx * 32 + lane] = 0;
         __syncthreads();
 
@@ -350,7 +354,11 @@ namespace operation
                        {
                            if constexpr (Dev == base::Device::CUDA)
                            {
-                               reduced = longTailContigReduceCUDA<T>(t, rdim);
+                               if constexpr (std::is_floating_point_v<T>)
+                                   reduced = longTailContigReduceCUDA<T>(t, rdim);
+                               else
+                                   throw std::runtime_error(
+                                       "sum reduce: only floating point supported");
                            }
                            else if constexpr (Dev == base::Device::CPU)
                            {
@@ -489,7 +497,11 @@ namespace operation
                        {
                            if constexpr (Dev == base::Device::CUDA)
                            {
-                               reduced = shortTailContigReduceCUDA<T>(t, rdim);
+                               if constexpr (std::is_floating_point_v<T>)
+                                   reduced = shortTailContigReduceCUDA<T>(t, rdim);
+                               else
+                                   throw std::runtime_error(
+                                       "sum reduce: only floating point supported");
                            }
                            else if constexpr (Dev == base::Device::CPU)
                            {
@@ -526,7 +538,7 @@ namespace operation
         for (int delta = 16; delta > 0; delta >>= 1)
             v += __shfl_down_sync(0xffffffffu, v, delta);
 
-        extern __shared__ T reduced[]; // blockDim.y 个 T
+        T *reduced = reinterpret_cast<T *>(shared_mem); // blockDim.y 个 T
         if (lane == 0)
             reduced[warp_idx] = v;
         __syncthreads();
@@ -590,7 +602,11 @@ namespace operation
                        {
                            if constexpr (Dev == base::Device::CUDA)
                            {
-                               reduced = lastDimContigReduceCUDA<T>(t);
+                               if constexpr (std::is_floating_point_v<T>)
+                                   reduced = lastDimContigReduceCUDA<T>(t);
+                               else
+                                   throw std::runtime_error(
+                                       "sum reduce: only floating point supported");
                            }
                            else if constexpr (Dev == base::Device::CPU)
                            {

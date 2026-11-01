@@ -576,8 +576,11 @@ namespace graph
                 graph::edge &edge = node->getEdge(i);
                 std::shared_ptr<Node> child = edge.first;
                 child->accumulate_grads(grads[i], edge.second);
-                if (--nodes_count[child] == 0)
+                nodes_count[child] = nodes_count[child] - 1;
+                if (nodes_count[child] == 0)
+                {
                     stack.push(child);
+                }
             }
         }
     }

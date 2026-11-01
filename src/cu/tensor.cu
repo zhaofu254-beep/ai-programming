@@ -271,7 +271,7 @@ namespace base
         const T *o = static_cast<const T *>(other);
 
         CHECK_KERNEL_FUNC(self_add_cuda_kernel<T>
-                          <<<blockNum, BLOCK_SIZE>>>(s, o, numel_);)
+                          <<<blockNum, BLOCK_SIZE>>>(s, o, numel_));
     }
 
     void TensorPart::operator+=(const TensorPart &other)

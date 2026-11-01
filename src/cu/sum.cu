@@ -642,11 +642,143 @@ namespace operation
         std::vector<graph::tensorPtr> inputs, int rdim)
     {
         graph::tensorPtr r = contigReduce(inputs[0], rdim);
-
-        std::shared_ptr<graph::Node> node = makeNode(inputs, rdim);
+        std::shared_ptr<SumNode> node = makeNode(inputs[0], r, rdim);
 
         r->autograd().grad_fn_ = node;
 
         return r;
+    }
+}
+
+namespace operation
+{
+    template <typename T>
+    graph::tensorPtr sumBackWardCPU(graph::tensorPtr prev, int64_t rdim, int64_t rdim_size)
+    {
+        int64_t prev_ndim = static_cast<int64_t>(prev->shape().size());
+        // next 形状 = prev 形状在 rdim 处插入 rdim_size
+        base::s_vec next_shape(prev_ndim + 1, 0);
+        for (int64_t i = 0; i < prev_ndim; ++i)
+            next_shape[i] = prev->shape()[i];
+        next_shape.insert(next_shape.begin() + rdim, rdim_size);
+
+        graph::tensorPtr next = std::make_shared<graph::TensorImpl>(
+            next_shape, prev->type(), prev->device(), prev->requires_grad());
+
+        T *next_data = static_cast<T *>(next->data().data());
+        const T *prev_data = static_cast<const T *>(prev->data().data());
+        const base::s_vec &prev_stride = prev->stride();
+        int64_t next_numel = next->numel();
+        int64_t next_ndim = static_cast<int64_t>(next->shape().size());
+
+        // 广播：每个 next 元素反解坐标（跳过 rdim）映射回 prev 下标
+        for (int64_t n = 0; n < next_numel; ++n)
+        {
+            int64_t rem = n;
+            int64_t prev_idx = 0;
+            for (int64_t d = next_ndim - 1; d >= 0; --d)
+            {
+                int64_t c = rem % next->shape()[d];
+                rem /= next->shape()[d];
+                if (d != rdim)
+                    prev_idx += c * prev_stride[(d < rdim) ? d : d - 1];
+            }
+            next_data[n] = prev_data[prev_idx];
+        }
+
+        return next;
+    }
+
+    template <typename T>
+    __global__ void sumBackWardKernel(const T *prev_grad, T *next_grad,
+                                      int64_t next_numel,
+                                      const int next_ndim,
+                                      const int64_t next_shape[],
+                                      const int64_t prev_stride[],
+                                      const int64_t rdim)
+    {
+        int64_t idx = blockDim.x * blockIdx.x + threadIdx.x;
+        if (idx >= next_numel)
+            return;
+
+        int64_t rem = idx;
+        int64_t prev_idx = 0;
+        for (int d = next_ndim - 1; d >= 0; --d)
+        {
+            int64_t c = rem % next_shape[d];
+            rem /= next_shape[d];
+            if (d != rdim)
+                prev_idx += c * prev_stride[(d < rdim) ? d : d - 1];
+        }
+        next_grad[idx] = prev_grad[prev_idx];
+    }
+
+    template <typename T>
+    graph::tensorPtr sumBackWardCUDA(graph::tensorPtr prev, int64_t rdim, int64_t rdim_size)
+    {
+        int64_t prev_ndim = static_cast<int64_t>(prev->shape().size());
+        // next 形状 = prev 形状在 rdim 处插入 rdim_size
+        base::s_vec next_shape(prev_ndim + 1, 0);
+        for (int64_t i = 0; i < prev_ndim; ++i)
+            next_shape[i] = prev->shape()[i];
+        next_shape.insert(next_shape.begin() + rdim, rdim_size);
+
+        graph::tensorPtr next = std::make_shared<graph::TensorImpl>(
+            next_shape, prev->type(), prev->device(), prev->requires_grad());
+
+        // prev 的连续 stride（行主序）
+        base::s_vec prev_stride(prev_ndim);
+        int64_t step = 1;
+        for (int64_t d = prev_ndim - 1; d >= 0; --d)
+        {
+            prev_stride[d] = step;
+            step *= prev->shape()[d];
+        }
+
+        std::vector<int64_t> next_shape_arr(next_shape.begin(), next_shape.end());
+        std::vector<int64_t> prev_stride_arr(prev_stride.begin(), prev_stride.end());
+
+        int64_t next_numel = next->numel();
+        int next_ndim = static_cast<int>(next_shape.size());
+        const int BLOCK_SIZE = 1024;
+        int grid_size = static_cast<int>(
+            (next_numel + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+        CHECK_KERNEL_FUNC(sumBackWardKernel<T>
+                          <<<grid_size, BLOCK_SIZE>>>(
+                              static_cast<const T *>(prev->data().data()),
+                              static_cast<T *>(next->data().data()),
+                              next_numel, next_ndim,
+                              next_shape_arr.data(), prev_stride_arr.data(), rdim));
+
+        return next;
+    }
+
+    // 实现sum的backward
+    std::vector<graph::tensorPtr> SumNode::backward()
+    {
+        if (!prev_grads_[0])
+            throw std::invalid_argument("No grad to be backward.");
+
+        graph::tensorPtr next;
+        base::dispatch(prev_grads_[0]->type().scalar_type_, prev_grads_[0]->device(),
+                       [&]<typename T, base::Device Dev>()
+                       {
+                           if constexpr (Dev == base::Device::CUDA)
+                           {
+                               next = sumBackWardCUDA<T>(
+                                   prev_grads_[0], rdim_, inputShape_[rdim_]);
+                           }
+                           else if constexpr (Dev == base::Device::CPU)
+                           {
+                               next = sumBackWardCPU<T>(
+                                   prev_grads_[0], rdim_, inputShape_[rdim_]);
+                           }
+                           else
+                               throw std::runtime_error(
+                                   "lastDimContigReduce: Unkown Device");
+                       });
+
+        return {next};
     }
 }

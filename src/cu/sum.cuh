@@ -21,32 +21,29 @@ namespace operation
     class SumNode : public graph::Node
     {
     private:
-        base::s_vec inputStrides, inputShape;
+        const base::s_vec inputStride_, inputShape_, outputStride_, outputShape_;
         const int rdim_;
 
-        SumNode(std::vector<graph::tensorPtr> adds, int rdim)
-            : Node(1, 1), rdim_(rdim)
+        SumNode(graph::tensorPtr input, graph::tensorPtr output, int rdim)
+            : Node(1, 1), rdim_(rdim), inputShape_(input->shape()),
+              inputStride_(input->stride()), outputShape_(output->shape()),
+              outputStride_(output->stride())
         {
-            next_edges_[0] = {adds[0]->autograd().grad_fn_, 0};
+            next_edges_[0] = {input->autograd().grad_fn_, 0};
         }
         friend SumOpr;
 
     public:
-        std::vector<graph::tensorPtr> backward()
-        {
-            if (!prev_grads_[0])
-                throw std::invalid_argument("No grad to be backward.");
-            // TODO: 反向需把输出梯度沿 rdim_ 广播（expand）回输入，尚未实现。
-            return {};
-        }
+        std::vector<graph::tensorPtr> backward();
     };
+
     class SumOpr
     {
     private:
-        std::shared_ptr<graph::Node> makeNode(
-            std::vector<graph::tensorPtr> inputs, int rdim)
+        std::shared_ptr<SumNode> makeNode(
+            graph::tensorPtr input, graph::tensorPtr output, int rdim)
         {
-            return std::shared_ptr<graph::Node>(new SumNode(inputs, rdim));
+            return std::shared_ptr<SumNode>(new SumNode(input, output, rdim));
         }
 
     public:

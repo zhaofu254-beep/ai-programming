@@ -29,7 +29,11 @@ namespace operation
               inputStride_(input->stride()), outputShape_(output->shape()),
               outputStride_(output->stride())
         {
-            next_edges_[0] = {input->autograd().grad_fn_, 0};
+            // 叶子张量的 grad_fn_ 为 null，此时边应指向其 accumulator_（AccumulateGrad）
+            std::shared_ptr<graph::Node> input_grad_fn = input->autograd().grad_fn_;
+            if (!input_grad_fn)
+                input_grad_fn = input->autograd().accumulator_;
+            next_edges_[0] = {input_grad_fn, 0};
         }
         friend SumOpr;
 

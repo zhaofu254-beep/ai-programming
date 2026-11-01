@@ -534,6 +534,8 @@ namespace graph
             stack.pop();
             for (auto &next_node : node->next_edges())
             {
+                if (!next_node.first) // 跳过空边（叶子未接 accumulator 等）
+                    continue;
                 nodes_count[next_node.first] += 1;       // 每条父边使 child 入度 +1
                 if (seen.insert(next_node.first).second) // 首次见到才入栈
                     stack.push(next_node.first);
@@ -571,16 +573,15 @@ namespace graph
             if (grads.empty())
                 continue;
 
-            for (size_t i = 0; i < edges_num && i < edges_num; ++i)
+            for (size_t i = 0; i < edges_num && i < grads.size(); ++i)
             {
                 graph::edge &edge = node->getEdge(i);
                 std::shared_ptr<Node> child = edge.first;
+                if (!child) // 跳过空边
+                    continue;
                 child->accumulate_grads(grads[i], edge.second);
-                nodes_count[child] = nodes_count[child] - 1;
-                if (nodes_count[child] == 0)
-                {
+                if (--nodes_count[child] == 0)
                     stack.push(child);
-                }
             }
         }
     }

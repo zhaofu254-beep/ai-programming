@@ -671,11 +671,8 @@ namespace operation
     template <typename T>
     graph::tensorPtr sumBackWardCPU(graph::tensorPtr prev, int64_t rdim, int64_t rdim_size)
     {
-        int64_t prev_ndim = static_cast<int64_t>(prev->shape().size());
         // next 形状 = prev 形状在 rdim 处插入 rdim_size
-        base::s_vec next_shape(prev_ndim + 1, 0);
-        for (int64_t i = 0; i < prev_ndim; ++i)
-            next_shape[i] = prev->shape()[i];
+        base::s_vec next_shape = prev->shape();
         next_shape.insert(next_shape.begin() + rdim, rdim_size);
 
         graph::tensorPtr next = std::make_shared<graph::TensorImpl>(
@@ -734,9 +731,7 @@ namespace operation
     {
         int64_t prev_ndim = static_cast<int64_t>(prev->shape().size());
         // next 形状 = prev 形状在 rdim 处插入 rdim_size
-        base::s_vec next_shape(prev_ndim + 1, 0);
-        for (int64_t i = 0; i < prev_ndim; ++i)
-            next_shape[i] = prev->shape()[i];
+        base::s_vec next_shape = prev->shape();
         next_shape.insert(next_shape.begin() + rdim, rdim_size);
 
         graph::tensorPtr next = std::make_shared<graph::TensorImpl>(

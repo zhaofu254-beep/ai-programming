@@ -33,6 +33,9 @@ int main()
     (*t)[0][1][1][0].set(3.14f);
     (*t)[0][1][1][1].set(3.14f);
 
+    // 叶子张量需在算子之前设置 accumulator，反向时梯度才能累积到 t.grad_
+    t->autograd().accumulator_ = std::make_shared<graph::AccumulateGrad>(t);
+
     operation::SumOpr sumopr;
     auto y = sumopr({t}, 1);
     std::cout << "sum(t,dim=1): " << std::endl;
@@ -44,12 +47,10 @@ int main()
     graph::Engine engine;
     auto z = sumopr({y}, 1);
 
-    // std::shared_ptr<graph::AccumulateGrad> accum = std::make_shared<graph::AccumulateGrad>(t);
-    // t->autograd().accumulator_ = accum;
-
     engine.backward(z);
-    // std::cout << "t.grad_: " << std::endl;
-    // t->autograd().grad_->print();
+    std::cout << "t.grad_: "
+              << ((t->autograd().grad_ != nullptr) ? "exist" : "not exist") << std::endl;
+    t->autograd().grad_->print();
 
     return 0;
 }

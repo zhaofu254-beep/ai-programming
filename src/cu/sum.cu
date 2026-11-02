@@ -23,9 +23,9 @@ namespace operation
     // 动态共享内存的原始声明（供归约 kernel 内 reinterpret_cast 使用）
     extern __shared__ char shared_mem[];
 
-    // coalesce_dimensions —— 合并相邻且连续（stride[i] == stride[i+1]*shape[i+1]）的非归约维；
+    // detail::coalesce_dimensions —— 合并相邻且连续（stride[i] == stride[i+1]*shape[i+1]）的非归约维；
     // 返回 {new_shape, new_stride, new_masked_dims_idx}（归约维在新坐标系中的下标）。
-    std::array<base::s_vec, 3> coalesce_dimensions(
+    std::array<base::s_vec, 3> detail::coalesce_dimensions(
         base::s_vec shape, base::s_vec stride, std::vector<bool> masked_dims)
     {
         base::s_vec new_shape, new_stride, new_masked_dims_idx;
@@ -176,7 +176,7 @@ namespace operation
         std::vector<bool> masked_dims(ndim, false);
         masked_dims[rdim] = true;
         auto [new_shape, new_stride, new_reduce_idx] =
-            coalesce_dimensions(t->shape(), t->stride(), masked_dims);
+            detail::coalesce_dimensions(t->shape(), t->stride(), masked_dims);
         int64_t new_rdim = new_reduce_idx[0]; // 归约维在合并后坐标系中的下标
 
         // 合并后的输出 stride（行主序，去掉归约维）
@@ -304,7 +304,7 @@ namespace operation
         // 标记归约维并合并连续非归约维（连续张量 + 中间归约 -> [outer, reduce, tail]）
         std::vector<bool> mask(ndim, false);
         mask[rdim] = true;
-        auto coalesced = coalesce_dimensions(t->shape(), t->stride(), mask);
+        auto coalesced = detail::coalesce_dimensions(t->shape(), t->stride(), mask);
         base::s_vec shape = coalesced[0];
         while (shape.size() < 3)
             shape.insert(shape.begin(), 1); // 归约最外层维时补一个 outer=1
@@ -437,7 +437,7 @@ namespace operation
         // 标记归约维并合并连续非归约维（连续张量 + 中间归约 -> [outer, reduce, tail]）
         std::vector<bool> mask(ndim, false);
         mask[rdim] = true;
-        auto coalesced = coalesce_dimensions(t->shape(), t->stride(), mask);
+        auto coalesced = detail::coalesce_dimensions(t->shape(), t->stride(), mask);
         base::s_vec shape = coalesced[0];
         while (shape.size() < 3)
             shape.insert(shape.begin(), 1);
@@ -557,7 +557,7 @@ namespace operation
 
         std::vector<bool> mask(ndim, false);
         mask[ndim - 1] = true;
-        auto coalesced = coalesce_dimensions(t->shape(), t->stride(), mask);
+        auto coalesced = detail::coalesce_dimensions(t->shape(), t->stride(), mask);
         base::s_vec shape = coalesced[0];
         if (shape.size() == 1)
             shape.insert(shape.begin(), 1); // [reduce] -> [1, reduce]
@@ -617,7 +617,7 @@ namespace operation
         return reduced;
     }
 
-    graph::tensorPtr contigReduce(graph::tensorPtr t, int64_t rdim = -1)
+    graph::tensorPtr detail::contigReduce(graph::tensorPtr t, int64_t rdim)
     {
         if (rdim < -1 || rdim >= static_cast<int64_t>(t->shape().size()))
             throw(std::invalid_argument("Rdim Out of Range"));
@@ -655,7 +655,7 @@ namespace operation
     graph::tensorPtr SumOpr::operator()(
         std::vector<graph::tensorPtr> inputs, int rdim)
     {
-        graph::tensorPtr r = contigReduce(inputs[0], rdim);
+        graph::tensorPtr r = detail::contigReduce(inputs[0], rdim);
         std::shared_ptr<SumNode> node = makeNode(inputs[0], r, rdim);
 
         r->autograd().grad_fn_ = node;

@@ -14,8 +14,13 @@
 
 namespace operation
 {
-    std::array<base::s_vec, 3> coalesce_dimensions(
-        base::s_vec shape, base::s_vec stride, std::vector<bool> masked_dims);
+    namespace detail
+    {
+        std::array<base::s_vec, 3> coalesce_dimensions(
+            base::s_vec shape, base::s_vec stride, std::vector<bool> masked_dims);
+
+        graph::tensorPtr contigReduce(graph::tensorPtr t, int64_t rdim = -1);
+    }
 
     class SumOpr;
     class SumNode : public graph::Node

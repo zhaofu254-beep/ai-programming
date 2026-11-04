@@ -36,8 +36,8 @@ int main()
     // 叶子张量需在算子之前设置 accumulator，反向时梯度才能累积到 t.grad_
     t->autograd().accumulator_ = std::make_shared<graph::AccumulateGrad>(t);
 
-    operation::SumOpr sumopr1;
-    auto y = sumopr1({t}, 1);
+    operation::SumOpr sumoprCPU(1);
+    auto y = sumoprCPU({t});
     std::cout << "sum(t,dim=1): " << std::endl;
     y->print();
     std::cout << "y.grad_fn "
@@ -45,7 +45,7 @@ int main()
 
     // 验证cpu的sum反向可行
     graph::Engine engine1;
-    auto z = sumopr1({y}, 1);
+    auto z = sumoprCPU({y});
 
     engine1.backward(z);
     std::cout << "t.grad_: "
@@ -69,20 +69,26 @@ int main()
     // 叶子张量需在算子之前设置 accumulator，反向时梯度才能累积到 t.grad_
     s->autograd().accumulator_ = std::make_shared<graph::AccumulateGrad>(s);
 
-    operation::SumOpr sumopr2;
-    auto s1 = sumopr2({s}, 0); // small,s1.shape = [ 4, 256, 256, 4 ]
+    operation::SumOpr sumopr1(0);
+    auto s1 = sumopr1({s}); // small,s1.shape = [ 4, 256, 256, 4 ]
     std::cout << "small dim reduce fine, s1.grad_ "
               << ((s1->autograd().grad_fn_ != nullptr) ? "exist" : "not exist")
               << std::endl;
-    auto s2 = sumopr2({s1}, 2); // short tail,s2.shape = [ 4, 256, 4 ]
+
+    operation::SumOpr sumopr2(2);
+    auto s2 = sumopr2({s1}); // short tail,s2.shape = [ 4, 256, 4 ]
     std::cout << "short tail reduce fine, s2.grad_ "
               << ((s2->autograd().grad_fn_ != nullptr) ? "exist" : "not exist")
               << std::endl;
-    auto s3 = sumopr2({s2}, 2); // last dim,s3.shape = [ 4, 256 ]
+
+    operation::SumOpr sumopr3(2);
+    auto s3 = sumopr3({s2}); // last dim,s3.shape = [ 4, 256 ]
     std::cout << "last dim reduce fine, s3.grad_ "
               << ((s3->autograd().grad_fn_ != nullptr) ? "exist" : "not exist")
               << std::endl;
-    auto s4 = sumopr2({s3}, 1); // long tail,s4.shape = [ 4 ]
+
+    operation::SumOpr sumopr4(1);
+    auto s4 = sumopr4({s3}); // long tail,s4.shape = [ 4 ]
     std::cout << "long tail reduce fine, s4.grad_ "
               << ((s4->autograd().grad_fn_ != nullptr) ? "exist" : "not exist")
               << std::endl;

@@ -7,6 +7,8 @@
 #include <array>
 #include <ranges>
 #include <cstdlib>
+#include <optional>
+
 #include <cuda_runtime.h>
 #include "error.cuh"
 
@@ -324,7 +326,8 @@ namespace graph
         {
             return next_edges_.at(i);
         }
-        const std::vector<edge> &next_edges() { return next_edges_; }
+        std::vector<edge> &next_edges() { return next_edges_; }
+        const std::vector<edge> &next_edges() const { return next_edges_; }
         int edges_num() { return next_edges_.size(); }
         void accumulate_grads(tensorPtr prev, int idx);
         virtual std::vector<tensorPtr> backward() = 0;
@@ -442,7 +445,6 @@ namespace operation
     {
     public:
         virtual bool broadcastingSupport() = 0;
-        virtual std::shared_ptr<graph::Node> makeNode(std::vector<graph::tensorPtr>) = 0;
         virtual graph::tensorPtr operator()(std::vector<graph::tensorPtr>) = 0;
     };
 }

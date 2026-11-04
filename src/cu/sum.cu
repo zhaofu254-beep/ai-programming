@@ -653,10 +653,10 @@ namespace operation
     }
 
     graph::tensorPtr SumOpr::operator()(
-        std::vector<graph::tensorPtr> inputs, int rdim)
+        std::vector<graph::tensorPtr> inputs)
     {
-        graph::tensorPtr r = detail::contigReduce(inputs[0], rdim);
-        std::shared_ptr<SumNode> node = makeNode(inputs[0], r, rdim);
+        graph::tensorPtr r = detail::contigReduce(inputs[0], rdim_);
+        std::shared_ptr<SumNode> node = makeNode(inputs[0], r, rdim_);
 
         r->autograd().grad_fn_ = node;
 

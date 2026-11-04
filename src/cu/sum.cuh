@@ -44,9 +44,10 @@ namespace operation
         std::vector<graph::tensorPtr> backward();
     };
 
-    class SumOpr
+    class SumOpr : public Opr
     {
     private:
+        const int rdim_;
         std::shared_ptr<SumNode> makeNode(
             graph::tensorPtr input, graph::tensorPtr output, int rdim)
         {
@@ -54,9 +55,12 @@ namespace operation
         }
 
     public:
+        SumOpr() = delete;
+        SumOpr(int rdim = -1) : Opr(), rdim_(rdim) {};
         bool broadcastingSupport() { return false; }
+        int getRdim() const { return rdim_; }
         graph::tensorPtr operator()(
-            std::vector<graph::tensorPtr> inputs, int rdim = -1);
+            std::vector<graph::tensorPtr> inputs);
     };
 
 }

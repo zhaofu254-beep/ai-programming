@@ -577,7 +577,7 @@ namespace graph
             {
                 graph::edge &edge = node->getEdge(i);
                 std::shared_ptr<Node> child = edge.first;
-                if (!child) // 跳过空边
+                if (!child || !grads[i]) // 跳过空边，以及 requires_grad=false 导致的空梯度
                     continue;
                 child->accumulate_grads(grads[i], edge.second);
                 if (--nodes_count[child] == 0)

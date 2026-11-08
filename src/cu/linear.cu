@@ -19,8 +19,10 @@ namespace operation
                              float alpha, float beta, base::s_vec &sOut,
                              bool transposeA, bool transposeB)
     {
+        bool requires_grad = A->requires_grad() || B->requires_grad() ||
+                             (bias && C->requires_grad());
         graph::tensorPtr D = std::make_shared<graph::TensorImpl>(
-            sOut, A->type(), A->device(), A->requires_grad());
+            sOut, A->type(), A->device(), requires_grad);
         D->fill(0);
 
         const T *a = static_cast<const T *>(A->data().data());
@@ -74,8 +76,10 @@ namespace operation
         int64_t M = sOut[0], N = sOut[1];
         int64_t K = transposeA ? A->shape()[0] : A->shape()[1];
 
+        bool requires_grad = A->requires_grad() || B->requires_grad() ||
+                             (bias && C->requires_grad());
         graph::tensorPtr D = std::make_shared<graph::TensorImpl>(
-            sOut, A->type(), A->device(), A->requires_grad());
+            sOut, A->type(), A->device(), requires_grad);
 
         const float *a = static_cast<const float *>(A->data().data());
         const float *b = static_cast<const float *>(B->data().data());

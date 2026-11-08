@@ -27,11 +27,19 @@ namespace operation
         LinearNode(graph::tensorPtr w, graph::tensorPtr x, graph::tensorPtr b, bool bias = true)
             : Node((bias) ? 3 : 2, 1), W(w), X(x), bias_(bias)
         {
-            // LinearNode的0, 1, 2 edge分别对应W, X, b
-            next_edges_[0] = {w->autograd().grad_fn_, 0};
-            next_edges_[1] = {x->autograd().grad_fn_, 0};
+            // LinearNode的0, 1, 2 edge分别对应W, X, b；叶子用 accumulator_ 回退
+            std::shared_ptr<graph::Node> w_fn = w->autograd().grad_fn_;
+            if (!w_fn) w_fn = w->autograd().accumulator_;
+            std::shared_ptr<graph::Node> x_fn = x->autograd().grad_fn_;
+            if (!x_fn) x_fn = x->autograd().accumulator_;
+            next_edges_[0] = {w_fn, 0};
+            next_edges_[1] = {x_fn, 0};
             if (bias)
-                next_edges_[2] = {b->autograd().grad_fn_, 0};
+            {
+                std::shared_ptr<graph::Node> b_fn = b->autograd().grad_fn_;
+                if (!b_fn) b_fn = b->autograd().accumulator_;
+                next_edges_[2] = {b_fn, 0};
+            }
         }
         friend LinearOpr;
 

@@ -5,11 +5,9 @@
 #include <vector>
 #include <map>
 #include <array>
-#include <ranges>
 #include <cstdlib>
 #include <optional>
 
-#include <cuda_runtime.h>
 #include "error.cuh"
 
 namespace base
@@ -313,7 +311,9 @@ namespace graph
     class Node
     {
     protected:
+        // i = edge[1]表示该node是edge[0]的第i个输出下游，通常为0
         std::vector<edge> next_edges_;
+        // prev_grads_[i]表示下游传回来的需要的第i个grad，通常size = 1
         std::vector<tensorPtr> prev_grads_;
 
     public:

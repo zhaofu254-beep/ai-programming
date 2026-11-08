@@ -5,11 +5,7 @@
 #include <vector>
 #include <map>
 #include <array>
-#include <ranges>
-#include <cstdlib>
-#include <cuda_runtime.h>
 
-#include "error.cuh"
 #include "tensor.cuh"
 
 namespace operation
@@ -55,7 +51,6 @@ namespace operation
         }
 
     public:
-        SumOpr() = delete;
         SumOpr(int rdim = -1) : Opr(), rdim_(rdim) {};
         bool broadcastingSupport() { return false; }
         int getRdim() const { return rdim_; }

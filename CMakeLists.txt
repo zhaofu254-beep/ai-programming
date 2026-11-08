@@ -15,14 +15,19 @@ find_package(CUDAToolkit REQUIRED)
 
 add_library(tensor STATIC src/cu/tensor.cu)
 add_library(sum STATIC src/cu/sum.cu)
+add_library(linear STATIC src/cu/linear.cu)
 
 target_include_directories(tensor PUBLIC src/cu)
 target_include_directories(sum PUBLIC src/cu)
+target_include_directories(linear PUBLIC src/cu)
 
 target_link_libraries(tensor PUBLIC CUDA::cudart)
 target_link_libraries(sum PUBLIC CUDA::cudart)
+target_link_libraries(linear PUBLIC CUDA::cudart CUDA::cublas tensor sum)
 
 #编译测试的可执行文件
-add_executable(test_sum tests/test_sum.cpp)
+# add_executable(test_sum tests/test_sum.cpp)
+add_executable(test_linear tests/test_linear.cpp)
 
-target_link_libraries(test_sum PRIVATE tensor sum)
+# target_link_libraries(test_sum PRIVATE tensor sum)
+target_link_libraries(test_linear PRIVATE tensor linear)

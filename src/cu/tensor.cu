@@ -1,5 +1,5 @@
 #include <cuda.h>
-#include <cuda_runtime.h>
+
 #include <cstring>
 #include <cmath>
 #include <cstdlib>
@@ -543,7 +543,7 @@ namespace graph
         }
     }
 
-    // Engine::backward —— 拓扑序反向传播；去掉重复默认实参；用 accumulate_grads 累加路由
+    // Engine::backward —— 拓扑序反向传播；去掉重复默认实参；用 accumulate_grads 累加
     void Engine::backward(tensorPtr t, tensorPtr grad)
     {
         std::shared_ptr<Node> root = t->autograd().grad_fn_;

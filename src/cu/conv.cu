@@ -198,8 +198,7 @@ namespace operation // Conv 正向传播
         graph::tensorPtr Wflat = std::make_shared<graph::TensorImpl>(kernel->view(w_shape));
 
         // (N, C_out, H, W)
-        bool requires_grad = X->requires_grad() || kernel->requires_grad() ||
-                             (bias && b->requires_grad());
+        bool requires_grad = X->requires_grad() || kernel->requires_grad() || (bias && b->requires_grad());
         graph::tensorPtr Y = std::make_shared<graph::TensorImpl>(
             base::s_vec{N, C_out, H, W}, X->type(), X->device(), requires_grad);
 
@@ -237,12 +236,11 @@ namespace operation // Conv 正向传播
         return Y;
     }
 }
+
 namespace operation // 这个实现col2img
 {
     // 与 im2col 对应：x (H*W, C_in*9)，
     // x_col (C_in, H, W)
-    // 采用 gather 写法：每个输出像素 (c, ih, iw) 累加所有覆盖它的窗口，
-    // 避免 CUDA 下 scatter 写同一位置产生的数据竞争，也无需预先清零图像梯度。
     void col2imgCPU(const float *x, int C_in, int H, int W, float *x_col)
     {
         const int KK = 3 * 3;
@@ -340,17 +338,18 @@ namespace operation // 这个实现backward
             kernel_shape, kernel->type(), kernel->device(), false);
         kernelFlat_grad->fill(0);
 
-        graph::tensorPtr X_grad = (X->requires_grad()) ? std::make_shared<graph::TensorImpl>(
-                                                             X->shape(), X->type(), X->device(), false)
-                                                       : nullptr;
+        graph::tensorPtr X_grad = (X->requires_grad())
+                                      ? std::make_shared<graph::TensorImpl>(
+                                            X->shape(), X->type(), X->device(), false)
+                                      : nullptr;
 
         for (int n = 0; n < N; n++)
         {
             int64_t prev_offset = n * C_out * H * W;
             graph::tensorPtr prevn = std::make_shared<graph::TensorImpl>(
                 std::make_shared<base::TensorPart>(
-                    prev->part().storage(), prev->type(), base::s_vec{C_out, H, W},
-                    base::s_vec{H * W, W, 1}, prev_offset),
+                    prev->part().storage(), prev->type(), base::s_vec{C_out, H * W},
+                    base::s_vec{H * W, 1}, prev_offset),
                 false);
 
             // 计算Wflat_grad
@@ -359,22 +358,25 @@ namespace operation // 这个实现backward
                 auto xcol = XcolSave_[n];
                 auto kernelFlat_grad_n = detail::GEMM(
                     prevn, xcol, nullptr, false, 1.0f, 0.0f, false, true);
+
                 kernelFlat_grad->accumulate(kernelFlat_grad_n);
             }
 
             // 计算X_grad_n
             if (X->requires_grad())
             {
+                // ∂L/∂Xcol = prevn^T @ kernelFlat = (H*W, C_out) @ (C_out, C_in*9) = (H*W, C_in*9)
                 auto xcoln_grad = detail::GEMM(
-                    prevn, kernelFlat, nullptr, false, 1.0f, 0.0f, true, false);
+                    prevn, kernelFlat, nullptr, false, 1.0f, 0.0f, true, true);
                 col2img(xcoln_grad, X_grad, C_in, H, W, n);
             }
         }
 
         base::s_vec w_kernel_shape{C_out, C_in, 3, 3};
-        graph::tensorPtr kernel_grad = (kernel->requires_grad()) ? std::make_shared<graph::TensorImpl>(
-                                                                       kernelFlat_grad->view(w_kernel_shape))
-                                                                 : nullptr;
+        graph::tensorPtr kernel_grad = (kernel->requires_grad())
+                                           ? std::make_shared<graph::TensorImpl>(
+                                                 kernelFlat_grad->view(w_kernel_shape))
+                                           : nullptr;
 
         if (bias_)
         {

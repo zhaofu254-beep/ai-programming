@@ -200,6 +200,7 @@ namespace base
         s_vec strides_;
         s_vec shape_;
         int64_t storage_offset_ = 0;
+        bool canViewByView(s_vec from, s_vec to);
         static Storage makeFromShape(int64_t size, Device dvc, TypeMeta tp);
         static int64_t numel_count(const s_vec &shape);
         static void cpu_continuous_copy(void *src, void *target,
@@ -290,6 +291,7 @@ namespace base
                               storage_offset_);
         }
         TensorPart permute(const std::vector<int8_t> &dimOrder);
+        TensorPart view(s_vec new_shape);
         // TensorPart continuous();
         // TensorPart reshape(s_vec shape);
 
@@ -358,7 +360,7 @@ namespace graph
     class TensorImpl
     {
     private:
-        std::shared_ptr<base::TensorPart> data_;
+        std::shared_ptr<base::TensorPart> part_;
         bool requires_grad_ = true;
         AutogradMeta autograd_;
 
@@ -366,19 +368,30 @@ namespace graph
         TensorImpl(base::s_vec shape, base::TypeMeta tp,
                    base::Device dvc = base::Device::CPU,
                    bool requires_grad = true)
-            : data_(std::make_shared<base::TensorPart>(shape, tp, dvc)),
+            : part_(std::make_shared<base::TensorPart>(shape, tp, dvc)),
               requires_grad_(requires_grad) {}
 
-        TensorImpl(std::shared_ptr<base::TensorPart> data, bool requires_grad = true)
-            : data_(std::move(data)), requires_grad_(requires_grad) {}
+        TensorImpl(std::shared_ptr<base::TensorPart> part, bool requires_grad = true)
+            : part_(std::move(part)), requires_grad_(requires_grad) {}
 
-        base::TensorPart &data() { return *data_; }
-        const base::TensorPart &data() const { return *data_; }
-        const base::s_vec &shape() const { return data_->shape(); }
-        const base::s_vec &stride() const { return data_->strides(); }
-        base::Device device() const { return data_->device(); }
-        base::TypeMeta type() const { return data_->type(); }
-        int64_t numel() { return data_->numel(); }
+        base::TensorPart &part() { return *part_; }
+        const base::TensorPart &part() const { return *part_; }
+        void *data()
+        {
+            return part_->data();
+        }
+        const void *data() const { return part_->data(); }
+        const base::s_vec &shape() const { return part_->shape(); }
+        const base::s_vec &strides() const { return part_->strides(); }
+        base::Device device() const { return part_->device(); }
+        base::TypeMeta type() const { return part_->type(); }
+        int64_t numel() { return part_->numel(); }
+        bool is_continue() { return part_->is_continue(); }
+        TensorImpl view(base::s_vec new_shape)
+        {
+            auto part = std::make_shared<base::TensorPart>(part_->view(new_shape));
+            return TensorImpl(part, requires_grad_);
+        }
 
         AutogradMeta &autograd()
         {
@@ -387,14 +400,14 @@ namespace graph
 
         void fill(float f)
         {
-            data_->fill(f);
+            part_->fill(f);
         }
 
         TensorImpl to(base::Device dvc)
         {
-            if (dvc == data_->device())
+            if (dvc == part_->device())
                 return *this;
-            return TensorImpl(std::make_shared<base::TensorPart>(data_->to(dvc)));
+            return TensorImpl(std::make_shared<base::TensorPart>(part_->to(dvc)));
         }
 
         // 使用索引递归访问：
@@ -423,7 +436,7 @@ namespace graph
 
         void accumulate(tensorPtr t)
         {
-            (*data_) += t->data();
+            (*part_) += t->part();
         }
     };
 

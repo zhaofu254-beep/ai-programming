@@ -162,6 +162,76 @@ namespace base
                           std::move(strides_new), storage_offset_);
     }
 
+    bool TensorPart::canViewByView(s_vec from, s_vec to)
+    {
+        // 元素总数必须相同
+        int64_t pf = numel_count(from), pt = numel_count(to);
+        if (pf != pt)
+            return false;
+
+        if (pf == 0) // 空对空总可以转换
+            return true;
+
+        // 从右往左对齐压缩
+        int i = static_cast<int>(from.size()) - 1;
+        int j = static_cast<int>(to.size()) - 1;
+        while (i >= 0 && j >= 0)
+        {
+            // size==1 可随意增删
+            if (from[i] == 1)
+            {
+                i -= 1;
+                continue;
+            }
+            if (to[j] == 1)
+            {
+                j -= 1;
+                continue;
+            }
+
+            // 维度一致，一起前移
+            if (from[i] == to[j])
+            {
+                i -= 1;
+                j -= 1;
+            }
+            else if (to[j] % from[i] == 0)
+            {
+                to[j] /= from[i]; // from 尾块更小，切掉 to[j] 的一块
+                i -= 1;
+            }
+            else if (from[i] % to[j] == 0)
+            {
+                from[i] /= to[j]; // to 尾块更小，切掉 from[i] 的一块
+                j -= 1;
+            }
+            else
+            {
+                return false; // 不能互转
+            }
+        }
+        return true;
+    }
+
+    TensorPart TensorPart::view(s_vec new_shape)
+    {
+        if (!canViewByView(new_shape, shape_))
+            throw(std::invalid_argument("Shape Wrong!"));
+        if (!is_continue())
+            throw std::invalid_argument("view only supports contiguous tensor");
+
+        s_vec strides;
+        strides.resize(new_shape.size());
+        int64_t step = 1;
+        for (int64_t i = static_cast<int64_t>(new_shape.size()) - 1; i >= 0; --i)
+        {
+            strides[i] = step;
+            step *= new_shape[i];
+        }
+
+        return TensorPart(strg_, type_, new_shape, strides, storage_offset_);
+    }
+
     void TensorPart::cpu_continuous_copy(void *src, void *target,
                                          int64_t numel, int64_t itemsize,
                                          const s_vec &shape, const s_vec &s_stride,
@@ -348,31 +418,31 @@ namespace graph
 
     TensorImpl::IndexProxy TensorImpl::operator[](int64_t i)
     {
-        const auto &shape = data().shape();
+        const auto &shape = part().shape();
         if (shape.empty())
             throw std::out_of_range("Empty tensor");
         if (i < 0 || i >= shape[0])
             throw std::out_of_range("Index out of range");
-        int64_t off = i * data().strides()[0] * data().type().itemsize_;
+        int64_t off = i * part().strides()[0] * part().type().itemsize_;
         return IndexProxy(this, off, 1);
     }
 
     TensorImpl::IndexProxy TensorImpl::IndexProxy::operator[](int64_t i) const
     {
-        const auto &shape = t_->data().shape();
+        const auto &shape = t_->shape();
         int64_t ndim = static_cast<int64_t>(shape.size());
         if (dim_ >= ndim)
             throw std::out_of_range("Too many indices");
         if (i < 0 || i >= shape[dim_])
             throw std::out_of_range("Index out of range");
         int64_t off = byte_offset_ +
-                      i * t_->data().strides()[dim_] * t_->data().type().itemsize_;
+                      i * t_->strides()[dim_] * t_->type().itemsize_;
         return IndexProxy(t_, off, dim_ + 1);
     }
 
     float TensorImpl::IndexProxy::get() const
     {
-        const base::TensorPart &tp = t_->data();
+        const base::TensorPart &tp = t_->part();
         int64_t ndim = static_cast<int64_t>(tp.shape().size());
         if (dim_ != ndim)
             throw std::out_of_range(
@@ -389,7 +459,7 @@ namespace graph
 
     void TensorImpl::IndexProxy::set(float v) const
     {
-        base::TensorPart &tp = t_->data();
+        base::TensorPart &tp = t_->part();
         int64_t ndim = static_cast<int64_t>(tp.shape().size());
         if (dim_ != ndim)
             throw std::out_of_range(
@@ -404,7 +474,7 @@ namespace graph
 
     TensorImpl TensorImpl::IndexProxy::slice() const
     {
-        const base::TensorPart &tp = t_->data();
+        const base::TensorPart &tp = t_->part();
         const base::s_vec &shape = tp.shape();
         const base::s_vec &strides = tp.strides();
         int64_t ndim = static_cast<int64_t>(shape.size());
@@ -453,7 +523,7 @@ namespace graph
 
     void TensorImpl::print() const
     {
-        const base::TensorPart &tp = *data_;
+        const base::TensorPart &tp = *part_;
         const base::s_vec &shape = tp.shape();
         const base::s_vec &strides = tp.strides();
         int64_t storage_offset = tp.storage_offset();

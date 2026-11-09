@@ -25,9 +25,9 @@ namespace operation
             sOut, A->type(), A->device(), requires_grad);
         D->fill(0);
 
-        const T *a = static_cast<const T *>(A->data().data());
-        const T *b = static_cast<const T *>(B->data().data());
-        T *d = static_cast<T *>(D->data().data());
+        const T *a = static_cast<const T *>(A->data());
+        const T *b = static_cast<const T *>(B->data());
+        T *d = static_cast<T *>(D->data());
 
         int64_t M = sOut[0], N = sOut[1];
         int64_t K = transposeA ? A->shape()[0] : A->shape()[1];
@@ -49,21 +49,25 @@ namespace operation
         // 按 C->numel() 取模广播
         if (bias)
         {
-            const T *c = static_cast<const T *>(C->data().data());
+            const T *c = static_cast<const T *>(C->data());
             for (int64_t i = 0; i < D->numel(); ++i)
                 d[i] += beta * c[i % C->numel()];
         }
 
         return D;
     }
-
-    // 加 bias 的 CUDA kernel
-    __global__ void addBiasKernel(float *d, const float *c, int64_t numel, int64_t cNumel, float beta)
+    namespace detail
     {
-        int64_t idx = blockDim.x * blockIdx.x + threadIdx.x;
-        if (idx >= numel)
-            return;
-        d[idx] += beta * c[idx % cNumel];
+
+        // 加 bias 的 CUDA kernel
+        __global__ void addBiasKernel(
+            float *d, const float *c, int64_t numel, int64_t cNumel, float beta)
+        {
+            int64_t idx = blockDim.x * blockIdx.x + threadIdx.x;
+            if (idx >= numel)
+                return;
+            d[idx] += beta * c[idx % cNumel];
+        }
     }
 
     template <typename T>
@@ -81,9 +85,9 @@ namespace operation
         graph::tensorPtr D = std::make_shared<graph::TensorImpl>(
             sOut, A->type(), A->device(), requires_grad);
 
-        const float *a = static_cast<const float *>(A->data().data());
-        const float *b = static_cast<const float *>(B->data().data());
-        float *d = static_cast<float *>(D->data().data());
+        const float *a = static_cast<const float *>(A->data());
+        const float *b = static_cast<const float *>(B->data());
+        float *d = static_cast<float *>(D->data());
 
         // 行主序 D = op(A) @ op(B)，列主序 D^T = op(B)^T @ op(A)^T
         cublasOperation_t transa = transposeB ? CUBLAS_OP_N : CUBLAS_OP_T;
@@ -104,14 +108,14 @@ namespace operation
         // 如果加 bias：D += beta * C
         if (bias)
         {
-            const float *c = static_cast<const float *>(C->data().data());
+            const float *c = static_cast<const float *>(C->data());
             int64_t numel = D->numel();
             int64_t cNumel = C->numel();
             int block = 256;
             int grid = static_cast<int>((numel + block - 1) / block);
             if (grid > 0)
             {
-                CHECK_KERNEL_FUNC(addBiasKernel<<<grid, block>>>(d, c, numel, cNumel, beta););
+                CHECK_KERNEL_FUNC(detail::addBiasKernel<<<grid, block>>>(d, c, numel, cNumel, beta););
             }
         }
 
@@ -134,9 +138,9 @@ namespace operation
             if (bias && dvc != C->device())
                 throw(std::invalid_argument("Must be on same Device!"));
 
-            if (!A->data().is_continue() || !B->data().is_continue())
+            if (!A->is_continue() || !B->is_continue())
                 throw(std::invalid_argument("Tensor Not Continue."));
-            if (bias && !C->data().is_continue())
+            if (bias && !C->is_continue())
                 throw(std::invalid_argument("Tensor Not Continue."));
 
             auto Ashape = A->shape(), Bshape = B->shape();

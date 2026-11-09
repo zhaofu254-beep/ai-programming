@@ -12,6 +12,8 @@ namespace operation
 {
     namespace detail
     {
+        __global__ void addBiasKernel(
+            float *d, const float *c, int64_t numel, int64_t cNumel, float beta);
         graph::tensorPtr GEMM(graph::tensorPtr A, graph::tensorPtr B,
                               graph::tensorPtr C, bool bias,
                               float alpha, float beta,
@@ -29,15 +31,18 @@ namespace operation
         {
             // LinearNode的0, 1, 2 edge分别对应W, X, b；叶子用 accumulator_ 回退
             std::shared_ptr<graph::Node> w_fn = w->autograd().grad_fn_;
-            if (!w_fn) w_fn = w->autograd().accumulator_;
+            if (!w_fn)
+                w_fn = w->autograd().accumulator_;
             std::shared_ptr<graph::Node> x_fn = x->autograd().grad_fn_;
-            if (!x_fn) x_fn = x->autograd().accumulator_;
+            if (!x_fn)
+                x_fn = x->autograd().accumulator_;
             next_edges_[0] = {w_fn, 0};
             next_edges_[1] = {x_fn, 0};
             if (bias)
             {
                 std::shared_ptr<graph::Node> b_fn = b->autograd().grad_fn_;
-                if (!b_fn) b_fn = b->autograd().accumulator_;
+                if (!b_fn)
+                    b_fn = b->autograd().accumulator_;
                 next_edges_[2] = {b_fn, 0};
             }
         }

@@ -78,10 +78,10 @@ namespace operation
             out_shape, t->type(), t->device(), t->requires_grad());
         reduced->fill(0);
 
-        T *reduced_data = static_cast<T *>(reduced->data().data());
-        const T *t_data = static_cast<const T *>(t->data().data());
+        T *reduced_data = static_cast<T *>(reduced->data());
+        const T *t_data = static_cast<const T *>(t->data());
         const base::s_vec &shape = t->shape();
-        const base::s_vec &stride = t->stride();
+        const base::s_vec &stride = t->strides();
         int64_t out_numel = reduced->numel();
         int64_t reduce_len = shape[rdim];
         int64_t reduce_stride = stride[rdim];
@@ -172,7 +172,7 @@ namespace operation
         std::vector<bool> masked_dims(ndim, false);
         masked_dims[rdim] = true;
         auto [new_shape, new_stride, new_reduce_idx] =
-            detail::coalesce_dimensions(t->shape(), t->stride(), masked_dims);
+            detail::coalesce_dimensions(t->shape(), t->strides(), masked_dims);
         int64_t new_rdim = new_reduce_idx[0]; // 归约维在合并后坐标系中的下标
 
         // 合并后的输出 stride（行主序，去掉归约维）
@@ -202,8 +202,8 @@ namespace operation
             (out_numel + BLOCK_SIZE - 1) / BLOCK_SIZE);
         CHECK_KERNEL_FUNC(smallContigReduceKernel<T>
                           <<<grid_size, BLOCK_SIZE>>>(
-                              static_cast<T *>(reduced->data().data()),
-                              static_cast<const T *>(t->data().data()),
+                              static_cast<T *>(reduced->data()),
+                              static_cast<const T *>(t->data()),
                               out_numel, s, new_rdim,
                               static_cast<int>(new_shape.size())));
 
@@ -300,7 +300,7 @@ namespace operation
         // 标记归约维并合并连续非归约维（连续张量 + 中间归约 -> [outer, reduce, tail]）
         std::vector<bool> mask(ndim, false);
         mask[rdim] = true;
-        auto coalesced = detail::coalesce_dimensions(t->shape(), t->stride(), mask);
+        auto coalesced = detail::coalesce_dimensions(t->shape(), t->strides(), mask);
         base::s_vec shape = coalesced[0];
         while (shape.size() < 3)
             shape.insert(shape.begin(), 1); // 归约最外层维时补一个 outer=1
@@ -335,8 +335,8 @@ namespace operation
 
         CHECK_KERNEL_FUNC(longTailContigReduceKernel<T>
                           <<<grid, block, shared_bytes>>>(
-                              static_cast<T *>(r->data().data()),
-                              static_cast<const T *>(t->data().data()),
+                              static_cast<T *>(r->data()),
+                              static_cast<const T *>(t->data()),
                               s, oneLineBlockNum, WARP_ACCUMU_NUM));
 
         return r;
@@ -344,7 +344,7 @@ namespace operation
 
     graph::tensorPtr longTailContigReduce(graph::tensorPtr t, const int64_t rdim)
     {
-        if (!t->data().is_continue())
+        if (!t->is_continue())
             throw(std::invalid_argument("tensor must be continuous!"));
 
         graph::tensorPtr reduced;
@@ -433,7 +433,7 @@ namespace operation
         // 标记归约维并合并连续非归约维（连续张量 + 中间归约 -> [outer, reduce, tail]）
         std::vector<bool> mask(ndim, false);
         mask[rdim] = true;
-        auto coalesced = detail::coalesce_dimensions(t->shape(), t->stride(), mask);
+        auto coalesced = detail::coalesce_dimensions(t->shape(), t->strides(), mask);
         base::s_vec shape = coalesced[0];
         while (shape.size() < 3)
             shape.insert(shape.begin(), 1);
@@ -476,8 +476,8 @@ namespace operation
 
         CHECK_KERNEL_FUNC(shortTailContigReduceKernel<T>
                           <<<grid, block>>>(
-                              static_cast<T *>(r->data().data()),
-                              static_cast<const T *>(t->data().data()),
+                              static_cast<T *>(r->data()),
+                              static_cast<const T *>(t->data()),
                               s, fold2exp, WARP_ACCUMU_NUM));
 
         return r;
@@ -553,7 +553,7 @@ namespace operation
 
         std::vector<bool> mask(ndim, false);
         mask[ndim - 1] = true;
-        auto coalesced = detail::coalesce_dimensions(t->shape(), t->stride(), mask);
+        auto coalesced = detail::coalesce_dimensions(t->shape(), t->strides(), mask);
         base::s_vec shape = coalesced[0];
         if (shape.size() == 1)
             shape.insert(shape.begin(), 1); // [reduce] -> [1, reduce]
@@ -581,8 +581,8 @@ namespace operation
 
         CHECK_KERNEL_FUNC(lastDimContigReduceKernel<T>
                           <<<grid, block, WARP_NUM * sizeof(T)>>>(
-                              static_cast<T *>(r->data().data()),
-                              static_cast<const T *>(t->data().data()),
+                              static_cast<T *>(r->data()),
+                              static_cast<const T *>(t->data()),
                               outer, reduce));
 
         return r;
@@ -618,7 +618,7 @@ namespace operation
         if (rdim < -1 || rdim >= static_cast<int64_t>(t->shape().size()))
             throw(std::invalid_argument("Rdim Out of Range"));
 
-        if (!t->data().is_continue())
+        if (!t->is_continue())
             throw(std::invalid_argument("Tensor Must Be Continuous"));
 
         rdim = (rdim == -1) ? t->shape().size() - 1 : rdim;
@@ -637,7 +637,7 @@ namespace operation
         else
         {
             const size_t MAX_SHORT_TAIL_SIZE = 32;
-            if (t->stride()[rdim] >= MAX_SHORT_TAIL_SIZE)
+            if (t->strides()[rdim] >= MAX_SHORT_TAIL_SIZE)
             {
                 return longTailContigReduce(t, rdim);
             }
@@ -672,9 +672,9 @@ namespace operation
         graph::tensorPtr next = std::make_shared<graph::TensorImpl>(
             next_shape, prev->type(), prev->device(), prev->requires_grad());
 
-        T *next_data = static_cast<T *>(next->data().data());
-        const T *prev_data = static_cast<const T *>(prev->data().data());
-        const base::s_vec &prev_stride = prev->stride();
+        T *next_data = static_cast<T *>(next->data());
+        const T *prev_data = static_cast<const T *>(prev->data());
+        const base::s_vec &prev_stride = prev->strides();
         int64_t next_numel = next->numel();
         int64_t next_ndim = static_cast<int64_t>(next->shape().size());
 
@@ -761,8 +761,8 @@ namespace operation
 
         CHECK_KERNEL_FUNC(sumBackWardKernel<T>
                           <<<grid_size, BLOCK_SIZE>>>(
-                              static_cast<const T *>(prev->data().data()),
-                              static_cast<T *>(next->data().data()),
+                              static_cast<const T *>(prev->data()),
+                              static_cast<T *>(next->data()),
                               next_numel, next_ndim, s, rdim));
 
         return next;

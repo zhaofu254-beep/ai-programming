@@ -5,7 +5,7 @@
 #include <memory>
 
 int main()
-{
+{ // 验证前向
     graph::tensorPtr x = std::make_shared<graph::TensorImpl>(
         base::s_vec{2, 2, 8, 8}, base::ScalarType::Float,
         base::Device::CUDA, true);
@@ -31,9 +31,27 @@ int main()
         base::Device::CUDA, true);
     b->fill(1.0f);
 
+    kernel->autograd().accumulator_ = std::make_shared<graph::AccumulateGrad>(kernel);
+    x->autograd().accumulator_ = std::make_shared<graph::AccumulateGrad>(x);
+    b->autograd().accumulator_ = std::make_shared<graph::AccumulateGrad>(b);
+
     operation::ConvOpr conv;
     auto y = conv({kernel, x, b});
     std::cout << "Conv forward is OK" << std::endl;
     y->print();
+    std::cout << std::endl;
+
+    // 验证后向
+    graph::Engine engine;
+    engine.backward(y);
+    std::cout << "backward fine." << std::endl
+              << " kernel.grad_ : " << std::endl;
+    kernel->autograd().grad_->print();
+    std::cout << "x.grad_" << std::endl;
+    x->autograd().grad_->print();
+    std::cout << "b.grad_" << std::endl;
+    b->autograd().grad_->print();
+    std::cout << std::endl;
+
     return 0;
 }

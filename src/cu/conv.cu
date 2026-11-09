@@ -237,8 +237,155 @@ namespace operation // Conv 正向传播
         return Y;
     }
 }
+namespace operation // 这个实现col2img
+{
+    // 与 im2col 对应：x (H*W, C_in*9)，
+    // x_col (C_in, H, W)
+    // 采用 gather 写法：每个输出像素 (c, ih, iw) 累加所有覆盖它的窗口，
+    // 避免 CUDA 下 scatter 写同一位置产生的数据竞争，也无需预先清零图像梯度。
+    void col2imgCPU(const float *x, int C_in, int H, int W, float *x_col)
+    {
+        const int KK = 3 * 3;
+        for (int c = 0; c < C_in; c++)
+            for (int ih = 0; ih < H; ih++)
+                for (int iw = 0; iw < W; iw++)
+                {
+                    float sum = 0.0f;
+                    for (int kh = 0; kh < 3; kh++)
+                        for (int kw = 0; kw < 3; kw++)
+                        {
+                            // ih = oh - 1 + kh  =>  oh = ih + 1 - kh
+                            int oh = ih + 1 - kh;
+                            int ow = iw + 1 - kw;
+                            if (oh >= 0 && oh < H && ow >= 0 && ow < W) // padding 丢弃
+                            {
+                                int row = oh * W + ow;
+                                sum += x[row * (C_in * KK) + (c * KK + kh * 3 + kw)];
+                                // 与x_col[row * (C_in * KK) + (c * KK + kh * 3 + kw)] = v 一致
+                            }
+                        }
+                    x_col[c * H * W + ih * W + iw] = sum;
+                    // 与v = x[c * H * W + ih * W + iw];一致
+                }
+    }
+
+    // CUDA 版：每个线程负责一个图像像素 (c, ih, iw)的输出，剩下的和CPU没什么区别
+    __global__ void col2imgKernel(const float *x, int C_in, int H, int W,
+                                  float *x_col)
+    {
+        int idx = blockDim.x * blockIdx.x + threadIdx.x;
+        int total = C_in * H * W;
+        if (idx >= total)
+            return;
+
+        int iw = idx % W;
+        int ih = (idx / W) % H;
+        int c = idx / (W * H);
+
+        float sum = 0.0f;
+        for (int kh = 0; kh < 3; kh++)
+            for (int kw = 0; kw < 3; kw++)
+            {
+                int oh = ih + 1 - kh;
+                int ow = iw + 1 - kw;
+                if (oh >= 0 && oh < H && ow >= 0 && ow < W)
+                {
+                    int row = oh * W + ow;
+                    sum += x[row * (C_in * 9) + (c * 9 + kh * 3 + kw)];
+                }
+            }
+        x_col[c * H * W + ih * W + iw] = sum;
+    }
+
+    void col2imgCUDA(const float *x, int C_in, int H, int W,
+                     float *x_col)
+    {
+        int total = C_in * H * W;
+        const int BLOCK_DIM = 256;
+        int grid = (total + BLOCK_DIM - 1) / BLOCK_DIM;
+        CHECK_KERNEL_FUNC(col2imgKernel<<<grid, BLOCK_DIM>>>(x, C_in, H, W, x_col););
+    }
+
+    // 把第 n 个样本的列梯度 Xcol(H*W, C_in*9) 累加回图像梯度 Ximg(N, C_in, H, W) 的 [n] 处
+    void col2img(graph::tensorPtr Xcol, graph::tensorPtr Ximg, int C_in, int H, int W, int n)
+    {
+        const float *x_ptr = static_cast<const float *>(Xcol->data());
+        float *ximg_ptr = static_cast<float *>(Ximg->data());
+        float *xn = ximg_ptr + static_cast<int64_t>(n) * C_in * H * W;
+
+        if (Ximg->device() == base::Device::CUDA)
+            col2imgCUDA(x_ptr, C_in, H, W, xn);
+        else
+            col2imgCPU(x_ptr, C_in, H, W, xn);
+    }
+
+}
 
 namespace operation // 这个实现backward
 {
 
+    std::vector<graph::tensorPtr> ConvNode::backward()
+    {
+        // 准备参数
+        auto prev = prev_grads_[0];
+        int N = static_cast<int>(X->shape()[0]);
+        int C_in = static_cast<int>(X->shape()[1]);
+        int H = static_cast<int>(X->shape()[2]);
+        int W = static_cast<int>(X->shape()[3]);
+        int C_out = static_cast<int>(kernel->shape()[0]);
+
+        base::s_vec kernel_shape{C_out, C_in * 9};
+        graph::tensorPtr kernelFlat = std::make_shared<graph::TensorImpl>(kernel->view(kernel_shape));
+        graph::tensorPtr kernelFlat_grad = std::make_shared<graph::TensorImpl>(
+            kernel_shape, kernel->type(), kernel->device(), false);
+        kernelFlat_grad->fill(0);
+
+        graph::tensorPtr X_grad = (X->requires_grad()) ? std::make_shared<graph::TensorImpl>(
+                                                             X->shape(), X->type(), X->device(), false)
+                                                       : nullptr;
+
+        for (int n = 0; n < N; n++)
+        {
+            int64_t prev_offset = n * C_out * H * W;
+            graph::tensorPtr prevn = std::make_shared<graph::TensorImpl>(
+                std::make_shared<base::TensorPart>(
+                    prev->part().storage(), prev->type(), base::s_vec{C_out, H, W},
+                    base::s_vec{H * W, W, 1}, prev_offset),
+                false);
+
+            // 计算Wflat_grad
+            if (kernel->requires_grad())
+            {
+                auto xcol = XcolSave_[n];
+                auto kernelFlat_grad_n = detail::GEMM(
+                    prevn, xcol, nullptr, false, 1.0f, 0.0f, false, true);
+                kernelFlat_grad->accumulate(kernelFlat_grad_n);
+            }
+
+            // 计算X_grad_n
+            if (X->requires_grad())
+            {
+                auto xcoln_grad = detail::GEMM(
+                    prevn, kernelFlat, nullptr, false, 1.0f, 0.0f, true, false);
+                col2img(xcoln_grad, X_grad, C_in, H, W, n);
+            }
+        }
+
+        base::s_vec w_kernel_shape{C_out, C_in, 3, 3};
+        graph::tensorPtr kernel_grad = (kernel->requires_grad()) ? std::make_shared<graph::TensorImpl>(
+                                                                       kernelFlat_grad->view(w_kernel_shape))
+                                                                 : nullptr;
+
+        if (bias_)
+        {
+            base::s_vec prev_flat_shape = {prev->shape()[0], C_out, H * W};
+            auto prev_flat_grad =
+                std::make_shared<graph::TensorImpl>(prev->view(prev_flat_shape));
+            auto b_batch_grad = detail::contigReduce(prev_flat_grad, -1);
+            auto b_grad = detail::contigReduce(b_batch_grad, 0);
+            return {kernel_grad, X_grad, b_grad};
+        }
+        else
+            return {kernel_grad, X_grad};
+    }
 }

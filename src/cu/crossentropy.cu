@@ -77,36 +77,39 @@ namespace operation
         return loss;
     }
 
-    graph::tensorPtr crossEntropy(graph::tensorPtr prob, graph::tensorPtr label)
+    namespace detail
     {
-        if (!prob->is_continue())
-            throw(std::invalid_argument("tensor must be continuous!"));
+        graph::tensorPtr crossEntropy(graph::tensorPtr prob, graph::tensorPtr label)
+        {
+            if (!prob->is_continue())
+                throw(std::invalid_argument("tensor must be continuous!"));
 
-        graph::tensorPtr loss;
-        base::dispatch(prob->type().scalar_type_, prob->device(),
-                       [&]<typename T, base::Device Dev>()
-                       {
-                           if constexpr (Dev == base::Device::CUDA)
+            graph::tensorPtr loss;
+            base::dispatch(prob->type().scalar_type_, prob->device(),
+                           [&]<typename T, base::Device Dev>()
                            {
-                               loss = crossEntropyCUDA<T>(prob, label);
-                           }
-                           else if constexpr (Dev == base::Device::CPU)
-                           {
-                               // CPU 统一用一套算法了。
-                               loss = crossEntropyCPU<T>(prob, label);
-                           }
-                           else
-                               throw std::runtime_error(
-                                   "CEL: Unkown Device");
-                       });
-        return detail::contigReduce(loss);
+                               if constexpr (Dev == base::Device::CUDA)
+                               {
+                                   loss = crossEntropyCUDA<T>(prob, label);
+                               }
+                               else if constexpr (Dev == base::Device::CPU)
+                               {
+                                   // CPU 统一用一套算法了。
+                                   loss = crossEntropyCPU<T>(prob, label);
+                               }
+                               else
+                                   throw std::runtime_error(
+                                       "CEL: Unkown Device");
+                           });
+            return contigReduce(loss);
+        }
     }
 
     graph::tensorPtr CrossEntropyOpr::operator()(std::vector<graph::tensorPtr> inputs)
     {
         auto input = inputs[0], label = inputs[1];
         auto prob = detail::softmax(input);
-        auto loss = crossEntropy(prob, label);
+        auto loss = detail::crossEntropy(prob, label);
 
         std::shared_ptr<CrossEntropyNode> node = makeNode(input, prob, label);
         loss->autograd().grad_fn_ = node;

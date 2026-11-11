@@ -438,6 +438,11 @@ namespace graph
         {
             (*part_) += t->part();
         }
+        TensorImpl operator*(TensorImpl t)
+        {
+            auto newPartPtr = std::make_shared<base::TensorPart>((*part_) * (*t.part_));
+            return TensorImpl(newPartPtr, requires_grad_ && t.requires_grad_);
+        }
     };
 
     class Engine
